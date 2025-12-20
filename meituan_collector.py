@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import subprocess
+import signal
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -54,6 +55,21 @@ TASK = "all"                        # 任务名称 (必填)
 HEADLESS = True                     # 浏览器模式: True=后台运行, False=显示窗口
 
 # ============================================================================
+# ★★★ 守护进程模式配置 ★★★
+# ============================================================================
+DEV_MODE = True                     # 开发模式: True=24小时运行, False=仅在工作时间运行
+WORK_START_HOUR = 8                 # 工作开始时间 (仅DEV_MODE=False时生效)
+WORK_END_HOUR = 23                  # 工作结束时间 (仅DEV_MODE=False时生效)
+NO_TASK_WAIT_SECONDS = 300          # 无任务时等待秒数 (5分钟)
+
+# ============================================================================
+# ★★★ 路径配置 (服务器部署时使用绝对路径) ★★★
+# ============================================================================
+DATA_DIR = "/home/meituan/data"                     # 数据根目录
+STATE_DIR = "/home/meituan/data/state"              # Cookie状态文件目录
+DOWNLOAD_DIR = "/home/meituan/data/downloads"       # 下载文件目录
+
+# ============================================================================
 # API配置 (一般不需要修改)
 # ============================================================================
 COOKIE_API_URL = "http://8.146.210.145:3000/api/get_namecookies"
@@ -66,7 +82,7 @@ TASK_SCHEDULE_API_URL = "http://8.146.210.145:3000/api/post_task_schedule"  # �
 GET_TASK_API_URL = "http://8.146.210.145:3000/api/get_task"  # 获取任务API
 TASK_CALLBACK_API_URL = "http://8.146.210.145:3000/api/task/callback"  # 任务完成回调API
 RESCHEDULE_FAILED_API_URL = "http://8.146.210.145:3000/api/task/reschedule-failed"  # 失败任务重新调度API
-SAVE_DIR = "./data"
+SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 
 # 各任务的上传API
 UPLOAD_APIS = {
@@ -110,6 +126,88 @@ SHARED_SIGNATURE = {
     'updated_at': None,      # 更新时间
     'shop_list': None,       # 门店列表
 }
+
+
+# ============================================================================
+# 守护进程模式: 信号处理和时间窗口控制
+# ============================================================================
+# 全局运行标志 (用于优雅退出)
+_daemon_running = True
+
+
+def _signal_handler(signum, frame):
+    """信号处理函数，用于优雅退出"""
+    global _daemon_running
+    _daemon_running = False
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    print(f"\n{'=' * 60}")
+    print(f"⚠️ 收到退出信号 ({sig_name})，等待当前任务完成后退出...")
+    print(f"{'=' * 60}")
+
+
+def _setup_signal_handlers():
+    """设置信号处理器"""
+    signal.signal(signal.SIGINT, _signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, _signal_handler)  # kill命令
+    print("✅ 已设置信号处理器 (支持Ctrl+C优雅退出)")
+
+
+def is_in_work_window() -> bool:
+    """检查当前是否在工作时间窗口内
+
+    DEV_MODE=True 时始终返回True (24小时运行)
+    DEV_MODE=False 时检查是否在 WORK_START_HOUR 至 WORK_END_HOUR 之间
+    """
+    if DEV_MODE:
+        return True
+    current_hour = datetime.now().hour
+    return WORK_START_HOUR <= current_hour < WORK_END_HOUR
+
+
+def seconds_until_work_start() -> int:
+    """计算距离下一个工作时间开始的秒数"""
+    now = datetime.now()
+    if now.hour >= WORK_END_HOUR:
+        # 今天已过工作结束时间，等到明天开始时间
+        next_start = now.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    elif now.hour < WORK_START_HOUR:
+        # 还没到今天的开始时间
+        next_start = now.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
+    else:
+        # 已在工作时间内
+        return 0
+    return int((next_start - now).total_seconds())
+
+
+def ensure_directories():
+    """确保所有必要的目录存在"""
+    directories = [DATA_DIR, STATE_DIR, DOWNLOAD_DIR]
+    for dir_path in directories:
+        try:
+            Path(dir_path).mkdir(parents=True, exist_ok=True)
+            print(f"✅ 目录已就绪: {dir_path}")
+        except Exception as e:
+            print(f"❌ 创建目录失败 {dir_path}: {e}")
+            raise
+
+
+def interruptible_sleep(seconds: int, check_interval: int = 10) -> bool:
+    """可中断的睡眠函数
+
+    Args:
+        seconds: 总睡眠秒数
+        check_interval: 检查间隔秒数
+
+    Returns:
+        bool: True=正常完成, False=被中断
+    """
+    global _daemon_running
+    elapsed = 0
+    while elapsed < seconds and _daemon_running:
+        sleep_time = min(check_interval, seconds - elapsed)
+        time.sleep(sleep_time)
+        elapsed += sleep_time
+    return _daemon_running
 
 
 # ============================================================================
@@ -1825,7 +1923,7 @@ class DianpingStoreStats:
         self.platform_api_url = platform_api_url
         self.headless = headless
         self.disable_proxy = disable_proxy
-        self.state_file = f'dianping_state_{account_name}.json'
+        self.state_file = os.path.join(STATE_DIR, f'dianping_state_{account_name}.json')
 
         # Playwright相关
         self.playwright = None
@@ -2658,7 +2756,7 @@ class PageDrivenTaskExecutor:
         """
         self.account_name = account_name
         self.headless = headless
-        self.state_file = f'dianping_state_{account_name}.json'
+        self.state_file = os.path.join(STATE_DIR, f'dianping_state_{account_name}.json')
 
         # Playwright相关
         self.playwright = None
@@ -3227,47 +3325,25 @@ def print_summary(results: List[Dict[str, Any]]):
     print("=" * 80)
 
 
-def main():
-    """主函数 - 任务调度驱动模式
+def execute_single_task(task_info: Dict[str, Any]) -> bool:
+    """执行单个任务
 
-    执行流程:
-    1. 调用 create_task_schedule() 生成任务调度
-    2. 等待5秒
-    3. 调用 fetch_task() 获取一条待执行任务
-    4. 填充配置变量并执行任务
-    5. 调用 report_task_callback() 上报任务结果
-    6. 调用 reschedule_failed_tasks() 重新调度失败任务
+    Args:
+        task_info: 从API获取的任务信息
+
+    Returns:
+        bool: 任务是否执行成功
     """
     global ACCOUNT_NAME, START_DATE, END_DATE, TASK, TARGET_DATE
 
-    print("\n" + "=" * 80)
-    print("美团点评数据采集系统 (任务调度模式)")
-    print("=" * 80)
-
-    # ========== Step 1: 生成任务调度 ==========
-    create_task_schedule()
-
-    # ========== Step 2: 等待5秒 ==========
-    print("\n⏳ 等待5秒...")
-    time.sleep(5)
-
-    # ========== Step 3: 获取任务 ==========
-    task_info = fetch_task()
-
-    if not task_info:
-        print("\n⚠️ 没有待执行的任务，直接进行失败任务重新调度")
-        reschedule_failed_tasks()
-        sys.exit(0)
-
-    # 保存任务ID用于后续回调
     task_id = task_info.get("id")
 
-    # ========== Step 4: 填充配置变量 ==========
+    # 填充配置变量
     ACCOUNT_NAME = task_info.get("account_id", "")
     START_DATE = task_info.get("data_start_date", "")
     END_DATE = task_info.get("data_end_date", "")
     TASK = task_info.get("task_type", "all")
-    TARGET_DATE = ""  # 留空
+    TARGET_DATE = ""
 
     account_name = ACCOUNT_NAME
     start_date = START_DATE
@@ -3281,22 +3357,19 @@ def main():
     print(f"   账户名称: {account_name}")
     print(f"   日期范围: {start_date} 至 {end_date}")
     print(f"   任务类型: {task}")
-    print(f"   TARGET_DATE: (留空)")
 
     # 验证参数
     if not account_name:
         error_msg = "账户名称为空"
         print(f"❌ {error_msg}")
         report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
-        reschedule_failed_tasks()
-        sys.exit(1)
+        return False
 
     if not validate_date(start_date) or not validate_date(end_date):
         error_msg = "日期格式错误，应为 YYYY-MM-DD"
         print(f"❌ {error_msg}")
         report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
-        reschedule_failed_tasks()
-        sys.exit(1)
+        return False
 
     start = datetime.strptime(start_date, '%Y-%m-%d')
     end = datetime.strptime(end_date, '%Y-%m-%d')
@@ -3304,16 +3377,14 @@ def main():
         error_msg = "开始日期不能大于结束日期"
         print(f"❌ {error_msg}")
         report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
-        reschedule_failed_tasks()
-        sys.exit(1)
+        return False
 
     valid_tasks = ['all'] + list(TASK_MAP.keys())
     if task not in valid_tasks:
         error_msg = f"无效的任务名称: {task}，可选值: {', '.join(valid_tasks)}"
         print(f"❌ {error_msg}")
         report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
-        reschedule_failed_tasks()
-        sys.exit(1)
+        return False
 
     print("\n" + "=" * 80)
     print("🚀 开始执行任务")
@@ -3327,11 +3398,10 @@ def main():
         print(f"                review_summary_dianping, review_summary_meituan")
     print("=" * 80)
 
-    # ========== Step 5: 执行任务 ==========
+    # 执行任务
     results = []
     try:
         if task == 'all':
-            # 使用页面驱动模式执行所有任务
             results = run_page_driven_tasks(
                 account_name=account_name,
                 start_date=start_date,
@@ -3339,27 +3409,24 @@ def main():
                 headless=HEADLESS
             )
         else:
-            # 执行单个任务
             result = TASK_MAP[task](account_name, start_date, end_date)
             results.append(result)
     except Exception as e:
         error_msg = f"任务执行异常: {str(e)}"
         print(f"❌ {error_msg}")
         report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
-        reschedule_failed_tasks()
-        sys.exit(1)
+        return False
 
     print_summary(results)
 
-    # 上报任务状态 (保留原有逻辑)
+    # 上报任务状态
     if task == 'all':
         upload_task_status_batch(account_name, start_date, end_date, results)
     else:
         if results:
             upload_task_status_single(account_name, start_date, end_date, results[0])
 
-    # ========== Step 6: 收集错误并上报任务回调 ==========
-    # 收集所有失败任务的错误信息
+    # 收集错误并上报任务回调
     task_errors = []
     for result in results:
         if not result.get('success'):
@@ -3368,17 +3435,119 @@ def main():
             task_errors.append(f"[{task_name}] {error_msg}")
 
     if len(task_errors) == 0:
-        # 全部成功
         report_task_callback(task_id, status=2, error_message="", retry_add=0)
+        return True
     else:
-        # 有失败的任务，合并所有错误信息
         all_errors = "\n".join(task_errors)
         report_task_callback(task_id, status=3, error_message=all_errors, retry_add=1)
+        return False
 
-    # ========== Step 7: 重新调度失败任务 ==========
-    reschedule_failed_tasks()
 
-    sys.exit(0 if all(r.get('success') for r in results) else 1)
+def main():
+    """主函数 - 守护进程模式
+
+    持续循环运行，自动获取并执行任务:
+    1. 检查时间窗口 (DEV_MODE=True时24小时运行)
+    2. 生成任务调度
+    3. 获取任务并执行
+    4. 无任务时等待5分钟后重试
+    5. 支持 Ctrl+C 优雅退出
+    """
+    global _daemon_running
+
+    # ========== 初始化 ==========
+    print("\n" + "=" * 80)
+    print("美团点评数据采集系统 (守护进程模式)")
+    print("=" * 80)
+    print(f"   运行模式: {'开发模式 (24小时运行)' if DEV_MODE else f'生产模式 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)'}")
+    print(f"   无任务等待: {NO_TASK_WAIT_SECONDS // 60} 分钟")
+    print(f"   数据目录: {DATA_DIR}")
+    print(f"   状态目录: {STATE_DIR}")
+    print(f"   下载目录: {DOWNLOAD_DIR}")
+    print("=" * 80)
+
+    # 设置信号处理器
+    _setup_signal_handlers()
+
+    # 确保目录存在
+    ensure_directories()
+
+    # 统计信息
+    total_tasks = 0
+    success_tasks = 0
+    failed_tasks = 0
+
+    print("\n🚀 开始守护进程循环...")
+    print("   按 Ctrl+C 可优雅退出\n")
+
+    # ========== 主循环 ==========
+    while _daemon_running:
+        try:
+            # ========== Step 1: 时间窗口检查 ==========
+            if not is_in_work_window():
+                wait_seconds = seconds_until_work_start()
+                hours = wait_seconds // 3600
+                minutes = (wait_seconds % 3600) // 60
+                print(f"\n{'=' * 60}")
+                print(f"💤 当前非工作时间 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)")
+                print(f"   将在 {hours}小时{minutes}分钟 后开始工作...")
+                print(f"{'=' * 60}")
+
+                if not interruptible_sleep(wait_seconds):
+                    break  # 收到退出信号
+                continue
+
+            # ========== Step 2: 生成任务调度 ==========
+            create_task_schedule()
+            time.sleep(5)
+
+            # ========== Step 3: 获取任务 ==========
+            task_info = fetch_task()
+
+            if not task_info:
+                print(f"\n⏳ 暂无待执行任务，{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
+                reschedule_failed_tasks()
+
+                if not interruptible_sleep(NO_TASK_WAIT_SECONDS):
+                    break  # 收到退出信号
+                continue
+
+            # ========== Step 4: 执行任务 ==========
+            total_tasks += 1
+            success = execute_single_task(task_info)
+
+            if success:
+                success_tasks += 1
+            else:
+                failed_tasks += 1
+
+            # ========== Step 5: 重新调度失败任务 ==========
+            reschedule_failed_tasks()
+
+            # 打印当前统计
+            print(f"\n📊 累计统计: 总任务={total_tasks}, 成功={success_tasks}, 失败={failed_tasks}")
+
+            # 短暂等待后继续下一轮
+            time.sleep(2)
+
+        except KeyboardInterrupt:
+            # 二次 Ctrl+C 强制退出
+            print("\n⚠️ 再次收到中断信号，强制退出...")
+            break
+        except Exception as e:
+            print(f"\n❌ 主循环发生异常: {e}")
+            import traceback
+            traceback.print_exc()
+            # 等待一段时间后继续
+            print(f"   将在60秒后继续运行...")
+            if not interruptible_sleep(60):
+                break
+
+    # ========== 退出 ==========
+    print("\n" + "=" * 80)
+    print("✅ 守护进程正常退出")
+    print(f"   总任务: {total_tasks}, 成功: {success_tasks}, 失败: {failed_tasks}")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
