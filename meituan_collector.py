@@ -2323,7 +2323,7 @@ class DianpingStoreStats:
             latest_df = df[df[date_col] == latest_date]
 
             shop_id_col = df.columns[3]
-            checkin_col = df.columns[16]
+            checkin_col = df.columns[36]  # AM列 - 第37列 - 打卡数
 
             for _, row in latest_df.iterrows():
                 shop_id = str(int(row[shop_id_col])) if pd.notna(row[shop_id_col]) else None
