@@ -82,6 +82,7 @@ TASK_SCHEDULE_API_URL = "http://8.146.210.145:3000/api/post_task_schedule"  # �
 GET_TASK_API_URL = "http://8.146.210.145:3000/api/get_task"  # 获取任务API
 TASK_CALLBACK_API_URL = "http://8.146.210.145:3000/api/task/callback"  # 任务完成回调API
 RESCHEDULE_FAILED_API_URL = "http://8.146.210.145:3000/api/task/reschedule-failed"  # 失败任务重新调度API
+GET_PLATFORM_ACCOUNT_API_URL = "http://8.146.210.145:3000/api/get_platform_account"  # 获取平台账户信息API
 SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 
 # 各任务的上传API
@@ -551,6 +552,91 @@ def get_shop_ids(shop_info) -> List[int]:
         elif isinstance(shop_info, dict) and shop_info.get('shopId'):
             shop_ids.append(int(shop_info.get('shopId')))
     return shop_ids if shop_ids else [0]
+
+
+def get_platform_account(account: str) -> Dict[str, Any]:
+    """获取平台账户信息
+
+    调用 /api/get_platform_account 获取账户的完整信息，包括：
+    - cookie: 登录凭证
+    - mtgsig: 签名信息
+    - templates_id: 报表模板ID
+    - stores_json: 门店信息
+    - auth_status: 登录状态
+    等
+
+    Args:
+        account: 账户名称（手机号）
+
+    Returns:
+        dict: 包含账户完整信息的字典
+            - success: 是否成功
+            - data: 账户数据（成功时）
+            - error_message: 错误信息（失败时）
+    """
+    print(f"\n{'─' * 50}")
+    print(f"🔍 获取平台账户信息: {account}")
+
+    headers = {'Content-Type': 'application/json'}
+    json_param = {"account": account}
+    proxies = {'http': None, 'https': None}
+
+    print(f"   URL: {GET_PLATFORM_ACCOUNT_API_URL}")
+    print(f"   请求参数: {json.dumps(json_param, ensure_ascii=False)}")
+
+    try:
+        response = requests.post(
+            GET_PLATFORM_ACCOUNT_API_URL,
+            headers=headers,
+            data=json.dumps(json_param),
+            proxies=proxies,
+            timeout=30
+        )
+        print(f"   HTTP状态码: {response.status_code}")
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success'):
+                data = result.get('data', {})
+                templates_id = data.get('templates_id')
+                auth_status = data.get('auth_status')
+                stores_json = data.get('stores_json', [])
+
+                print(f"   ✅ 获取成功")
+                print(f"   templates_id: {templates_id}")
+                print(f"   auth_status: {auth_status}")
+                print(f"   门店数量: {len(stores_json) if stores_json else 0}")
+
+                return {
+                    'success': True,
+                    'data': data,
+                    'templates_id': templates_id,
+                    'auth_status': auth_status,
+                    'cookie': data.get('cookie'),
+                    'mtgsig': data.get('mtgsig'),
+                    'stores_json': stores_json
+                }
+            else:
+                error_msg = result.get('message', '获取账户信息失败')
+                print(f"   ❌ API返回失败: {error_msg}")
+                return {
+                    'success': False,
+                    'error_message': error_msg
+                }
+        else:
+            error_msg = f"HTTP状态码: {response.status_code}"
+            print(f"   ❌ 请求失败: {error_msg}")
+            return {
+                'success': False,
+                'error_message': error_msg
+            }
+    except Exception as e:
+        error_msg = f"请求异常: {str(e)}"
+        print(f"   ❌ {error_msg}")
+        return {
+            'success': False,
+            'error_message': error_msg
+        }
 
 
 def generate_mtgsig(cookies: dict, mtgsig_from_api: str = None) -> str:
@@ -2713,11 +2799,21 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
             log_failure(account_name, 0, table_name, target_date, target_date, result["error_message"])
 
     except Exception as e:
-        result["error_message"] = str(e)
+        error_msg = str(e)
+        result["error_message"] = error_msg
         print(f"❌ 执行失败: {e}")
         import traceback
         traceback.print_exc()
-        log_failure(account_name, 0, table_name, start_date, end_date, str(e))
+        # 上报到 /api/log
+        log_failure(account_name, 0, table_name, start_date, end_date, error_msg)
+        # 如果是登录失败，同时上报到 /api/account_task/update_batch
+        if "登录失败" in error_msg or "Cookie登录失败" in error_msg:
+            upload_task_status_single(account_name, start_date, end_date, {
+                'task_name': table_name,
+                'success': False,
+                'record_count': 0,
+                'error_message': error_msg
+            })
 
     return result
 
@@ -3055,9 +3151,23 @@ class PageDrivenTaskExecutor:
                 random_delay(3, 5)
 
         except Exception as e:
-            print(f"❌ 执行过程中发生错误: {e}")
+            error_msg = str(e)
+            print(f"❌ 执行过程中发生错误: {error_msg}")
             import traceback
             traceback.print_exc()
+
+            # 如果是登录失败，同时上报日志到两个接口
+            if "登录失败" in error_msg or "Cookie登录失败" in error_msg:
+                print(f"\n📤 上报登录失败日志...")
+                # 上报到 /api/log
+                log_failure(self.account_name, 0, "login_check", start_date, end_date, error_msg)
+                # 上报到 /api/account_task/update_batch
+                upload_task_status_batch(self.account_name, start_date, end_date, [{
+                    'task_name': 'login_check',
+                    'success': False,
+                    'record_count': 0,
+                    'error_message': error_msg
+                }])
         finally:
             self.stop_browser()
 
@@ -3385,6 +3495,45 @@ def execute_single_task(task_info: Dict[str, Any]) -> bool:
         print(f"❌ {error_msg}")
         report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
+
+    # ========== 获取平台账户信息并检查 templates_id ==========
+    print(f"\n{'=' * 80}")
+    print("🔍 检查平台账户配置")
+    print(f"{'=' * 80}")
+
+    platform_account = get_platform_account(account_name)
+
+    if not platform_account.get('success'):
+        error_msg = f"获取平台账户信息失败: {platform_account.get('error_message', '未知错误')}"
+        print(f"❌ {error_msg}")
+        # 同时上报到两个日志接口
+        log_failure(account_name, 0, "platform_account_check", start_date, end_date, error_msg)
+        upload_task_status_batch(account_name, start_date, end_date, [{
+            'task_name': 'platform_account_check',
+            'success': False,
+            'record_count': 0,
+            'error_message': error_msg
+        }])
+        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        return False
+
+    templates_id = platform_account.get('templates_id')
+    if templates_id == 0 or templates_id is None:
+        error_msg = "没有报表ID，无法继续执行，请确认是否在报表中心创建了：Kewen_data"
+        print(f"❌ {error_msg}")
+        print(f"   templates_id = {templates_id}")
+        # 同时上报到两个日志接口
+        log_failure(account_name, 0, "templates_id_check", start_date, end_date, error_msg)
+        upload_task_status_batch(account_name, start_date, end_date, [{
+            'task_name': 'templates_id_check',
+            'success': False,
+            'record_count': 0,
+            'error_message': error_msg
+        }])
+        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        return False
+
+    print(f"   ✅ templates_id 检查通过: {templates_id}")
 
     print("\n" + "=" * 80)
     print("🚀 开始执行任务")
