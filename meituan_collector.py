@@ -325,6 +325,88 @@ def report_auth_invalid(account_name: str) -> bool:
         return False
 
 
+def is_auth_invalid_error(code: int = None, message: str = None) -> bool:
+    """检测API响应是否为登录失效错误
+
+    判断条件:
+    - code == 401
+    - code == 606
+    - message 包含 "未登录"
+    - message 包含 "登录状态失效"
+    - message 包含 "请重新登录"
+
+    Args:
+        code: API返回的状态码
+        message: API返回的消息内容
+
+    Returns:
+        bool: True表示登录已失效，需要上报
+    """
+    # 检查状态码
+    if code in [401, 606]:
+        return True
+
+    # 检查消息内容
+    if message:
+        message_str = str(message)
+        auth_invalid_keywords = ["未登录", "登录状态失效", "请重新登录"]
+        for keyword in auth_invalid_keywords:
+            if keyword in message_str:
+                return True
+
+    return False
+
+
+def handle_auth_invalid(account_name: str, start_date: str, end_date: str,
+                        task_name: str, error_message: str) -> None:
+    """统一处理登录失效错误
+
+    处理流程:
+    1. 调用 report_auth_invalid() → /api/post/platform_accounts
+    2. 调用 log_failure() → /api/log
+    3. 调用 upload_task_status_batch() → /api/account_task/update_batch
+
+    Args:
+        account_name: 账户名称
+        start_date: 数据开始日期
+        end_date: 数据结束日期
+        task_name: 当前任务名称
+        error_message: 错误信息
+    """
+    print(f"\n{'=' * 60}")
+    print(f"🚨 检测到登录失效，开始上报到三个接口...")
+    print(f"   账户: {account_name}")
+    print(f"   任务: {task_name}")
+    print(f"   错误: {error_message}")
+    print(f"{'=' * 60}")
+
+    # 1. 上报账户失效状态到 /api/post/platform_accounts
+    report_auth_invalid(account_name)
+
+    # 2. 上报日志到 /api/log
+    log_failure(account_name, 0, task_name, start_date, end_date, f"登录失效: {error_message}")
+
+    # 3. 上报任务状态到 /api/account_task/update_batch
+    # 将当前任务标记为失败，其他任务标记为未执行
+    task_result = {
+        'task_name': task_name,
+        'success': False,
+        'record_count': 0,
+        'error_message': f"登录失效: {error_message}"
+    }
+    upload_task_status_batch(account_name, start_date, end_date, [task_result])
+
+    print(f"\n✅ 登录失效上报完成")
+
+
+class AuthInvalidError(Exception):
+    """登录失效异常
+
+    当检测到登录失效时抛出此异常，用于立即停止重试并终止任务
+    """
+    pass
+
+
 def upload_task_status_batch(account_id: str, start_date: str, end_date: str, results: List[Dict[str, Any]]) -> bool:
     """批量上报所有任务状态到API
 
@@ -816,6 +898,15 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
             resp_json = response.json()
             print(f"📊 请求响应: {resp_json}")
 
+            # 检查是否登录失效（code 606 或 message 包含登录失效关键词）
+            resp_code = resp_json.get('code')
+            resp_msg = resp_json.get('msg') or resp_json.get('message') or ''
+            if is_auth_invalid_error(resp_code, resp_msg):
+                error_msg = f"登录失效 (code={resp_code}, msg={resp_msg})"
+                print(f"🚨 检测到登录失效: {error_msg}")
+                handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+                raise AuthInvalidError(error_msg)
+
             # 检查请求是否成功
             result_type = resp_json.get('data', {}).get('resultType')
             if result_type == 3:
@@ -841,6 +932,15 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
                 list_params = {'pageNo': 1, 'pageSize': 20, 'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.1.1', 'mtgsig': generate_mtgsig(cookies, mtgsig)}
                 list_resp = session.get(list_url, params=list_params, headers=headers, cookies=cookies, timeout=30)
                 list_data = list_resp.json()
+
+                # 检查是否登录失效
+                list_code = list_data.get('code')
+                list_msg = list_data.get('msg') or list_data.get('message') or ''
+                if is_auth_invalid_error(list_code, list_msg):
+                    error_msg = f"登录失效 (code={list_code}, msg={list_msg})"
+                    print(f"🚨 检测到登录失效: {error_msg}")
+                    handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+                    raise AuthInvalidError(error_msg)
 
                 if list_data.get('code') == 200:
                     for record in list_data.get('data', {}).get('records', []):
@@ -943,6 +1043,11 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
             for shop_id in shop_ids:
                 log_failure(account_name, shop_id, table_name, start_date, end_date, result["error_message"])
 
+    except AuthInvalidError as e:
+        # 登录失效异常 - 已在检测时调用 handle_auth_invalid，这里只记录结果
+        result["error_message"] = str(e)
+        print(f"❌ 登录失效，任务终止: {e}")
+
     except Exception as e:
         result["error_message"] = str(e)
         print(f"❌ 执行失败: {e}")
@@ -1007,6 +1112,16 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
         response = session.get(url, params=params, headers=headers, cookies=cookies, timeout=60)
         resp_json = response.json()
         print(f"📊 请求响应: {resp_json}")
+
+        # 检查是否登录失效（code 401 或 message 包含登录失效关键词）
+        resp_code = resp_json.get('code')
+        resp_msg = resp_json.get('msg') or resp_json.get('message') or ''
+        if is_auth_invalid_error(resp_code, resp_msg):
+            error_msg = f"登录失效 (code={resp_code}, msg={resp_msg})"
+            print(f"🚨 检测到登录失效: {error_msg}")
+            handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+            raise AuthInvalidError(error_msg)
+
         random_delay()  # 反爬虫等待
 
         # 检查是否直接返回URL
@@ -1031,6 +1146,15 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
                                'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.0.4', 'mtgsig': generate_mtgsig(cookies, mtgsig)}
                 hist_resp = session.get(history_url, params=hist_params, headers=headers, cookies=cookies, timeout=30)
                 hist_data = hist_resp.json()
+
+                # 检查是否登录失效
+                hist_code = hist_data.get('code')
+                hist_msg = hist_data.get('msg') or hist_data.get('message') or ''
+                if is_auth_invalid_error(hist_code, hist_msg):
+                    error_msg = f"登录失效 (code={hist_code}, msg={hist_msg})"
+                    print(f"🚨 检测到登录失效: {error_msg}")
+                    handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+                    raise AuthInvalidError(error_msg)
 
                 for record in hist_data.get('records', []):
                     if record.get('status') == 2:
@@ -1137,6 +1261,11 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
             for shop_id in shop_ids:
                 log_failure(account_name, shop_id, table_name, start_date, end_date, result["error_message"])
 
+    except AuthInvalidError as e:
+        # 登录失效异常 - 已在检测时调用 handle_auth_invalid，这里只记录结果
+        result["error_message"] = str(e)
+        print(f"❌ 登录失效，任务终止: {e}")
+
     except Exception as e:
         result["error_message"] = str(e)
         print(f"❌ 执行失败: {e}")
@@ -1221,6 +1350,16 @@ def run_review_detail_dianping(account_name: str, start_date: str, end_date: str
             resp_json = resp.json()
 
             print(f"   API响应码: {resp_json.get('code')}")
+
+            # 检查是否登录失效
+            resp_code = resp_json.get('code')
+            resp_msg = resp_json.get('msg') or resp_json.get('message') or ''
+            if is_auth_invalid_error(resp_code, resp_msg):
+                error_msg = f"登录失效 (code={resp_code}, msg={resp_msg})"
+                print(f"🚨 检测到登录失效: {error_msg}")
+                handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+                raise AuthInvalidError(error_msg)
+
             if resp_json.get('code') != 200:
                 print(f"   ❌ API返回错误: {resp_json}")
                 break
@@ -1346,6 +1485,11 @@ def run_review_detail_dianping(account_name: str, start_date: str, end_date: str
             for shop_id in shop_ids:
                 log_failure(account_name, shop_id, table_name, start_date, end_date, result["error_message"])
 
+    except AuthInvalidError as e:
+        # 登录失效异常 - 已在检测时调用 handle_auth_invalid，这里只记录结果
+        result["error_message"] = str(e)
+        print(f"❌ 登录失效，任务终止: {e}")
+
     except Exception as e:
         result["error_message"] = str(e)
         print(f"❌ 执行失败: {e}")
@@ -1440,6 +1584,16 @@ def run_review_detail_meituan(account_name: str, start_date: str, end_date: str)
             resp_json = resp.json()
 
             print(f"   API响应码: {resp_json.get('code')}")
+
+            # 检查是否登录失效
+            resp_code = resp_json.get('code')
+            resp_msg = resp_json.get('msg') or resp_json.get('message') or ''
+            if is_auth_invalid_error(resp_code, resp_msg):
+                error_msg = f"登录失效 (code={resp_code}, msg={resp_msg})"
+                print(f"🚨 检测到登录失效: {error_msg}")
+                handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+                raise AuthInvalidError(error_msg)
+
             if resp_json.get('code') != 200:
                 print(f"   ❌ API返回错误: {resp_json}")
                 break
@@ -1560,6 +1714,11 @@ def run_review_detail_meituan(account_name: str, start_date: str, end_date: str)
             for shop_id in shop_ids:
                 log_failure(account_name, shop_id, table_name, start_date, end_date, result["error_message"])
 
+    except AuthInvalidError as e:
+        # 登录失效异常 - 已在检测时调用 handle_auth_invalid，这里只记录结果
+        result["error_message"] = str(e)
+        print(f"❌ 登录失效，任务终止: {e}")
+
     except Exception as e:
         result["error_message"] = str(e)
         print(f"❌ 执行失败: {e}")
@@ -1609,7 +1768,18 @@ def run_review_summary_dianping(account_name: str, start_date: str, end_date: st
         trigger_payload = {"tagId": 0, "platform": 1, "shopIdStr": "0", "startDate": start_date, "endDate": end_date}
 
         trigger_resp = session.post(trigger_url, params=trigger_params, headers=headers, cookies=cookies, json=trigger_payload, timeout=60)
-        print(f"   响应: {trigger_resp.json()}")
+        trigger_json = trigger_resp.json()
+        print(f"   响应: {trigger_json}")
+
+        # 检查触发响应是否登录失效
+        trigger_code = trigger_json.get('code')
+        trigger_msg = trigger_json.get('msg') or trigger_json.get('message') or ''
+        if is_auth_invalid_error(trigger_code, trigger_msg):
+            error_msg = f"登录失效 (code={trigger_code}, msg={trigger_msg})"
+            print(f"🚨 检测到登录失效: {error_msg}")
+            handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+            raise AuthInvalidError(error_msg)
+
         random_delay()  # 反爬虫等待
 
         # 等待文件生成
@@ -1623,6 +1793,15 @@ def run_review_summary_dianping(account_name: str, start_date: str, end_date: st
             list_params = {'pageNo': 1, 'pageSize': 20, 'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.1.1', 'mtgsig': generate_mtgsig(cookies, mtgsig)}
             list_resp = session.get(list_url, params=list_params, headers=headers, cookies=cookies, timeout=30)
             list_data = list_resp.json()
+
+            # 检查是否登录失效
+            list_code = list_data.get('code')
+            list_msg = list_data.get('msg') or list_data.get('message') or ''
+            if is_auth_invalid_error(list_code, list_msg):
+                error_msg = f"登录失效 (code={list_code}, msg={list_msg})"
+                print(f"🚨 检测到登录失效: {error_msg}")
+                handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+                raise AuthInvalidError(error_msg)
 
             if list_data.get('code') == 200:
                 for record in list_data.get('data', {}).get('records', []):
@@ -1768,6 +1947,11 @@ def run_review_summary_dianping(account_name: str, start_date: str, end_date: st
             for shop_id in shop_ids:
                 log_failure(account_name, shop_id, table_name, start_date, end_date, result["error_message"])
 
+    except AuthInvalidError as e:
+        # 登录失效异常 - 已在检测时调用 handle_auth_invalid，这里只记录结果
+        result["error_message"] = str(e)
+        print(f"❌ 登录失效，任务终止: {e}")
+
     except Exception as e:
         result["error_message"] = str(e)
         print(f"❌ 执行失败: {e}")
@@ -1817,7 +2001,18 @@ def run_review_summary_meituan(account_name: str, start_date: str, end_date: str
         trigger_payload = {"tagId": 0, "platform": 2, "shopIdStr": "0", "startDate": start_date, "endDate": end_date}
 
         trigger_resp = session.post(trigger_url, params=trigger_params, headers=headers, cookies=cookies, json=trigger_payload, timeout=60)
-        print(f"   响应: {trigger_resp.json()}")
+        trigger_json = trigger_resp.json()
+        print(f"   响应: {trigger_json}")
+
+        # 检查触发响应是否登录失效
+        trigger_code = trigger_json.get('code')
+        trigger_msg = trigger_json.get('msg') or trigger_json.get('message') or ''
+        if is_auth_invalid_error(trigger_code, trigger_msg):
+            error_msg = f"登录失效 (code={trigger_code}, msg={trigger_msg})"
+            print(f"🚨 检测到登录失效: {error_msg}")
+            handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+            raise AuthInvalidError(error_msg)
+
         random_delay()  # 反爬虫等待
 
         # 等待文件生成
@@ -1831,6 +2026,15 @@ def run_review_summary_meituan(account_name: str, start_date: str, end_date: str
             list_params = {'pageNo': 1, 'pageSize': 20, 'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.1.1', 'mtgsig': generate_mtgsig(cookies, mtgsig)}
             list_resp = session.get(list_url, params=list_params, headers=headers, cookies=cookies, timeout=30)
             list_data = list_resp.json()
+
+            # 检查是否登录失效
+            list_code = list_data.get('code')
+            list_msg = list_data.get('msg') or list_data.get('message') or ''
+            if is_auth_invalid_error(list_code, list_msg):
+                error_msg = f"登录失效 (code={list_code}, msg={list_msg})"
+                print(f"🚨 检测到登录失效: {error_msg}")
+                handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+                raise AuthInvalidError(error_msg)
 
             if list_data.get('code') == 200:
                 for record in list_data.get('data', {}).get('records', []):
@@ -1978,6 +2182,11 @@ def run_review_summary_meituan(account_name: str, start_date: str, end_date: str
             result["error_message"] = f"部分上传失败: 成功{success_count}, 失败{fail_count}"
             for shop_id in shop_ids:
                 log_failure(account_name, shop_id, table_name, start_date, end_date, result["error_message"])
+
+    except AuthInvalidError as e:
+        # 登录失效异常 - 已在检测时调用 handle_auth_invalid，这里只记录结果
+        result["error_message"] = str(e)
+        print(f"❌ 登录失效，任务终止: {e}")
 
     except Exception as e:
         result["error_message"] = str(e)
@@ -2232,7 +2441,8 @@ class DianpingStoreStats:
             if not self._check_login_status():
                 # 状态文件登录失败且API cookie登录也失败，上报账户失效状态
                 report_auth_invalid(self.account_name)
-                raise Exception("Cookie登录失败")
+                # 抛出 AuthInvalidError 异常，让调用者可以处理并上报到其他接口
+                raise AuthInvalidError("Cookie登录失败，账户登录状态已失效")
 
             self.context.storage_state(path=self.state_file)
             print(f"✓ 浏览器已启动（Cookie登录）")
@@ -2798,6 +3008,14 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
             result["error_message"] = "部分数据上传失败"
             log_failure(account_name, 0, table_name, target_date, target_date, result["error_message"])
 
+    except AuthInvalidError as e:
+        # 登录失效异常 - 调用三个接口上报
+        error_msg = str(e)
+        result["error_message"] = error_msg
+        print(f"❌ 登录失效: {e}")
+        # 使用统一的登录失效处理函数上报到三个接口
+        handle_auth_invalid(account_name, start_date, end_date, table_name, error_msg)
+
     except Exception as e:
         error_msg = str(e)
         result["error_message"] = error_msg
@@ -2806,14 +3024,6 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
         traceback.print_exc()
         # 上报到 /api/log
         log_failure(account_name, 0, table_name, start_date, end_date, error_msg)
-        # 如果是登录失败，同时上报到 /api/account_task/update_batch
-        if "登录失败" in error_msg or "Cookie登录失败" in error_msg:
-            upload_task_status_single(account_name, start_date, end_date, {
-                'task_name': table_name,
-                'success': False,
-                'record_count': 0,
-                'error_message': error_msg
-            })
 
     return result
 
@@ -3004,7 +3214,8 @@ class PageDrivenTaskExecutor:
 
             if not self._check_login_status():
                 report_auth_invalid(self.account_name)
-                raise Exception("Cookie登录失败")
+                # 抛出 AuthInvalidError 异常，让调用者可以处理并上报到其他接口
+                raise AuthInvalidError("Cookie登录失败，账户登录状态已失效")
 
             self.context.storage_state(path=self.state_file)
             print(f"✓ 浏览器已启动（Cookie登录）")
