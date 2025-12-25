@@ -3311,13 +3311,15 @@ class DianpingStoreStats:
 
         for idx, data in enumerate(upload_data_list, 1):
             try:
-                response = session.post(upload_api_url, json=data, headers={'Content-Type': 'application/json'}, timeout=30)
+                response = session.post(upload_api_url, json=data, headers={'Content-Type': 'application/json'}, timeout=API_TIMEOUT)
                 if response.status_code in [200, 201]:
                     success_count += 1
                     print(f"   [{idx}/{len(upload_data_list)}] ✅ 成功 - {data['store_name']}")
                 else:
                     fail_count += 1
                     print(f"   [{idx}/{len(upload_data_list)}] ❌ 失败 - {data['store_name']}")
+                    print(f"      HTTP状态码: {response.status_code}")
+                    print(f"      响应内容: {response.text[:200] if response.text else '(空)'}")
             except Exception as e:
                 fail_count += 1
                 print(f"   [{idx}/{len(upload_data_list)}] ❌ 失败 - {data['store_name']}: {e}")
