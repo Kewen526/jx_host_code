@@ -2563,6 +2563,10 @@ class DianpingStoreStats:
         self.external_page = external_page
         self.use_external_page = external_page is not None
 
+        # 登录失效标志 - 一旦检测到失效，停止后续数据获取
+        self.login_invalid = False
+        self.login_invalid_error = ""
+
         # 从API获取的数据
         self.cookies = {}
         self.mtgsig_from_api = None
@@ -2900,6 +2904,14 @@ class DianpingStoreStats:
             )
             time.sleep(3)
 
+            # 检查页面是否被重定向到登录页
+            current_url = self.page.url.lower()
+            if 'login' in current_url or 'passport' in current_url:
+                print(f"🚨 检测到页面被重定向到登录页，Cookie已失效")
+                self.login_invalid = True
+                self.login_invalid_error = "获取强制下线数据时检测到Cookie失效（重定向到登录页）"
+                return force_offline_count
+
             api_url = "https://e.dianping.com/gateway/msg/MessageDzService/queryPcMessageList"
             target_date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
 
@@ -2911,7 +2923,9 @@ class DianpingStoreStats:
                         headers: {{'Content-Type': 'application/json'}},
                         body: JSON.stringify({{"messageCategoryCode": 0, "status": null, "subCategoryIdList": null, "important": 1, "pageNo": 1, "pageSize": 100}})
                     }});
-                    return {{success: true, data: await response.json()}};
+                    const status = response.status;
+                    const data = await response.json();
+                    return {{success: true, status: status, data: data}};
                 }} catch(e) {{
                     return {{success: false, error: e.message}};
                 }}
@@ -2923,9 +2937,27 @@ class DianpingStoreStats:
                 print(f"❌ API调用失败: {result.get('error')}")
                 return force_offline_count
 
+            # 检查HTTP状态码是否是登录失效
+            http_status = result.get('status', 200)
+            if http_status == 401:
+                print(f"🚨 检测到HTTP 401，Cookie已失效")
+                self.login_invalid = True
+                self.login_invalid_error = "获取强制下线数据时检测到Cookie失效（HTTP 401）"
+                return force_offline_count
+
             api_result = result.get('data', {})
-            if api_result.get('status') != 0:
-                print(f"❌ API返回错误")
+            api_status = api_result.get('status')
+            api_msg = api_result.get('msg', '')
+
+            # 检查API返回是否是登录失效
+            if is_auth_invalid_error(api_status, api_msg):
+                print(f"🚨 检测到登录失效: status={api_status}, msg={api_msg}")
+                self.login_invalid = True
+                self.login_invalid_error = f"获取强制下线数据时检测到Cookie失效（API返回: status={api_status}, msg={api_msg}）"
+                return force_offline_count
+
+            if api_status != 0:
+                print(f"❌ API返回错误: status={api_status}, msg={api_msg}")
                 return force_offline_count
 
             message_list = api_result.get('messageList', [])
@@ -3208,11 +3240,27 @@ class DianpingStoreStats:
                 timeout=30
             )
 
+            # 检查HTTP状态码是否是登录失效
+            if response.status_code == 401:
+                print(f"🚨 检测到HTTP 401，Cookie已失效")
+                self.login_invalid = True
+                self.login_invalid_error = "获取财务余额时检测到Cookie失效（HTTP 401）"
+                return 0.0
+
             response.raise_for_status()
             result = response.json()
 
-            if result.get('code') != 0:
-                print(f"❌ API返回错误: {result.get('msg', '未知错误')}")
+            # 检查API返回是否是登录失效
+            api_code = result.get('code')
+            api_msg = result.get('msg', '')
+            if is_auth_invalid_error(api_code, api_msg):
+                print(f"🚨 检测到登录失效: code={api_code}, msg={api_msg}")
+                self.login_invalid = True
+                self.login_invalid_error = f"获取财务余额时检测到Cookie失效（API返回: code={api_code}, msg={api_msg}）"
+                return 0.0
+
+            if api_code != 0:
+                print(f"❌ API返回错误: {api_msg}")
                 return 0.0
 
             data_list = result.get('data', [])
@@ -3255,22 +3303,46 @@ class DianpingStoreStats:
             return 0.0
 
     def collect_and_upload(self, target_date: str, upload_api_url: str) -> bool:
-        """收集所有数据并上传"""
+        """收集所有数据并上传
+
+        Raises:
+            AuthInvalidError: 当检测到登录失效时抛出
+        """
         print("\n🚀 开始收集和上传数据")
         print(f"   目标日期: {target_date}")
         print(f"   门店数量: {len(self.shop_list)}")
 
         try:
             self.start_browser()
+
+            # 获取强制下线数据
             force_offline_data = self.get_force_offline_data(target_date)
+            if self.login_invalid:
+                raise AuthInvalidError(self.login_invalid_error)
             random_delay()  # 反爬虫等待
+
+            # 获取财务余额数据
             finance_balance = self.get_finance_balance()
+            if self.login_invalid:
+                raise AuthInvalidError(self.login_invalid_error)
             random_delay()  # 反爬虫等待
+
+            # 获取客流数据
             checkin_data = self.get_flow_data()
+            if self.login_invalid:
+                raise AuthInvalidError(self.login_invalid_error)
             random_delay()  # 反爬虫等待
+
+            # 获取同行排名数据
             rank_data = self.get_rival_rank_data()
+            if self.login_invalid:
+                raise AuthInvalidError(self.login_invalid_error)
             random_delay()  # 反爬虫等待
+
+            # 获取广告单数据
             ad_data = self.get_trade_data()
+            if self.login_invalid:
+                raise AuthInvalidError(self.login_invalid_error)
         finally:
             self.stop_browser()
 
@@ -3467,6 +3539,10 @@ class PageDrivenTaskExecutor:
 
         # 执行结果
         self.results = []
+
+        # 登录失效标志 - 一旦检测到失效，停止后续所有任务
+        self.login_invalid = False
+        self.login_invalid_error = ""
 
     def _disable_proxy(self):
         """禁用系统代理"""
@@ -3689,6 +3765,26 @@ class PageDrivenTaskExecutor:
                 # 使用 load 而不是 networkidle，避免因持续网络请求导致超时
                 self.page.goto(page_url, wait_until='load', timeout=BROWSER_PAGE_TIMEOUT)
                 time.sleep(3)  # 等待页面稳定
+
+                # 检查是否被重定向到登录页面
+                current_url = self.page.url.lower()
+                if 'login' in current_url or 'passport' in current_url:
+                    print(f"🚨 检测到页面被重定向到登录页，Cookie已失效")
+                    self.login_invalid = True
+                    self.login_invalid_error = "页面跳转时检测到Cookie失效（重定向到登录页）"
+                    return False
+
+                # 检查页面内容是否包含登录失效提示
+                try:
+                    page_content = self.page.content()
+                    if '请重新登录' in page_content or '登录状态失效' in page_content or '未登录' in page_content:
+                        print(f"🚨 检测到页面包含登录失效提示，Cookie已失效")
+                        self.login_invalid = True
+                        self.login_invalid_error = "页面跳转时检测到Cookie失效（页面提示未登录）"
+                        return False
+                except:
+                    pass  # 获取页面内容失败，继续执行
+
                 print(f"✅ 已跳转到 {page_name}")
                 return True
             except Exception as e:
@@ -3789,24 +3885,68 @@ class PageDrivenTaskExecutor:
             self.start_browser()
 
             for page_key in PAGE_ORDER:
+                # 检查是否已经检测到登录失效
+                if self.login_invalid:
+                    print(f"\n🚨 已检测到Cookie失效，跳过后续所有任务")
+                    # 将剩余任务标记为失败
+                    for remaining_page_key in PAGE_ORDER[PAGE_ORDER.index(page_key):]:
+                        for task_name in PAGE_TASKS.get(remaining_page_key, []):
+                            all_results.append({
+                                "task_name": task_name,
+                                "success": False,
+                                "record_count": 0,
+                                "error_message": f"Cookie失效，任务跳过: {self.login_invalid_error}"
+                            })
+                    break
+
                 page_name = self.PAGE_NAME_MAP.get(page_key)
 
                 # 跳转到页面
                 if not self.navigate_to_page(page_key):
-                    # 跳转失败，跳过该页面的任务
-                    print(f"⚠️ 跳过 {page_name} 的任务")
-                    for task_name in PAGE_TASKS.get(page_key, []):
-                        all_results.append({
-                            "task_name": task_name,
-                            "success": False,
-                            "record_count": 0,
-                            "error_message": f"页面跳转失败"
-                        })
-                    continue
+                    # 检查是否是因为登录失效导致的跳转失败
+                    if self.login_invalid:
+                        print(f"🚨 页面跳转失败，检测到Cookie已失效")
+                        # 上报登录失效并退出
+                        handle_auth_invalid(self.account_name, start_date, end_date,
+                                          "page_navigate", self.login_invalid_error)
+                        # 将所有任务标记为失败
+                        for remaining_page_key in PAGE_ORDER[PAGE_ORDER.index(page_key):]:
+                            for task_name in PAGE_TASKS.get(remaining_page_key, []):
+                                all_results.append({
+                                    "task_name": task_name,
+                                    "success": False,
+                                    "record_count": 0,
+                                    "error_message": f"Cookie失效: {self.login_invalid_error}"
+                                })
+                        break
+                    else:
+                        # 普通跳转失败，跳过该页面的任务
+                        print(f"⚠️ 跳过 {page_name} 的任务")
+                        for task_name in PAGE_TASKS.get(page_key, []):
+                            all_results.append({
+                                "task_name": task_name,
+                                "success": False,
+                                "record_count": 0,
+                                "error_message": f"页面跳转失败"
+                            })
+                        continue
 
                 # 执行该页面的任务
                 results = self.execute_page_tasks(page_key, start_date, end_date)
                 all_results.extend(results)
+
+                # 检查任务执行结果中是否有登录失效
+                for result in results:
+                    error_msg = result.get('error_message', '')
+                    if '登录失效' in error_msg or 'Cookie失效' in error_msg:
+                        self.login_invalid = True
+                        self.login_invalid_error = error_msg
+                        break
+
+                # 如果检测到登录失效，停止后续任务
+                if self.login_invalid:
+                    print(f"\n🚨 任务执行中检测到Cookie失效，停止后续任务")
+                    continue  # 跳到下一次循环，会被顶部的检查拦截
 
                 # 页面间随机延迟
                 random_delay(3, 5)
@@ -3818,17 +3958,9 @@ class PageDrivenTaskExecutor:
             traceback.print_exc()
 
             # 如果是登录失败，同时上报日志到两个接口
-            if "登录失败" in error_msg or "Cookie登录失败" in error_msg:
+            if "登录失败" in error_msg or "Cookie登录失败" in error_msg or "登录失效" in error_msg:
                 print(f"\n📤 上报登录失败日志...")
-                # 上报到 /api/log
-                log_failure(self.account_name, 0, "login_check", start_date, end_date, error_msg)
-                # 上报到 /api/account_task/update_batch
-                upload_task_status_batch(self.account_name, start_date, end_date, [{
-                    'task_name': 'login_check',
-                    'success': False,
-                    'record_count': 0,
-                    'error_message': error_msg
-                }])
+                handle_auth_invalid(self.account_name, start_date, end_date, "task_execution", error_msg)
         finally:
             self.stop_browser()
 
