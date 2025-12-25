@@ -11,16 +11,19 @@ import json
 import time
 import random
 import requests
+import requests.exceptions
 import pandas as pd
 import math
 import os
 import sys
 import subprocess
 import signal
-from typing import Dict, Any, Optional, List
+import logging
+from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta
 from io import BytesIO
+from contextlib import contextmanager
 
 # Playwright导入 (用于store_stats任务)
 try:
@@ -84,6 +87,39 @@ TASK_CALLBACK_API_URL = "http://8.146.210.145:3000/api/task/callback"  # 任务�
 RESCHEDULE_FAILED_API_URL = "http://8.146.210.145:3000/api/task/reschedule-failed"  # 失败任务重新调度API
 GET_PLATFORM_ACCOUNT_API_URL = "http://8.146.210.145:3000/api/get_platform_account"  # 获取平台账户信息API
 SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
+
+# ============================================================================
+# ★★★ 统一超时参数配置 ★★★
+# ============================================================================
+CONNECT_TIMEOUT = 10        # 连接建立超时（秒）
+API_TIMEOUT = 30            # 普通API请求超时（秒）
+DOWNLOAD_TIMEOUT = 120      # 文件下载超时（秒）
+BROWSER_PAGE_TIMEOUT = 60000  # 浏览器页面加载超时（毫秒）
+LOGIN_CHECK_TIMEOUT = 30000   # 登录检测超时（毫秒）
+
+# 指数退避重试配置
+MAX_RETRY_ATTEMPTS = 3      # 最大重试次数
+INITIAL_RETRY_DELAY = 2     # 初始重试延迟（秒）
+MAX_RETRY_DELAY = 60        # 最大重试延迟（秒）
+RETRY_BACKOFF_FACTOR = 2    # 退避因子
+
+# ============================================================================
+# ★★★ 日志配置 ★★★
+# ============================================================================
+LOG_LEVEL = logging.INFO
+LOG_FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
+LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+# 配置日志
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format=LOG_FORMAT,
+    datefmt=LOG_DATE_FORMAT,
+    handlers=[
+        logging.StreamHandler()  # 输出到控制台
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # 各任务的上传API
 UPLOAD_APIS = {
@@ -284,6 +320,246 @@ def get_session() -> requests.Session:
     session.trust_env = False
     session.proxies = {'http': None, 'https': None}
     return session
+
+
+@contextmanager
+def managed_session():
+    """Session上下文管理器，确保Session正确关闭"""
+    session = get_session()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def safe_json_parse(response: requests.Response, default: Any = None) -> Tuple[Any, Optional[str]]:
+    """安全解析JSON响应
+
+    Args:
+        response: requests响应对象
+        default: 解析失败时的默认返回值
+
+    Returns:
+        (解析结果, 错误信息) - 成功时错误信息为None
+    """
+    try:
+        return response.json(), None
+    except json.JSONDecodeError as e:
+        error_msg = f"JSON解析失败: {e}. 响应内容: {response.text[:200] if response.text else '(空)'}"
+        logger.error(error_msg)
+        return default, error_msg
+    except Exception as e:
+        error_msg = f"解析响应时发生未知错误: {e}"
+        logger.error(error_msg)
+        return default, error_msg
+
+
+def calculate_retry_delay(attempt: int, initial_delay: float = INITIAL_RETRY_DELAY,
+                          max_delay: float = MAX_RETRY_DELAY,
+                          backoff_factor: float = RETRY_BACKOFF_FACTOR) -> float:
+    """计算指数退避延迟时间（带抖动）
+
+    Args:
+        attempt: 当前重试次数（从1开始）
+        initial_delay: 初始延迟秒数
+        max_delay: 最大延迟秒数
+        backoff_factor: 退避因子
+
+    Returns:
+        延迟秒数（包含随机抖动）
+    """
+    delay = initial_delay * (backoff_factor ** (attempt - 1))
+    delay = min(delay, max_delay)
+    # 添加 ±25% 的随机抖动
+    jitter = delay * 0.25 * (2 * random.random() - 1)
+    return delay + jitter
+
+
+def is_retryable_error(error: Exception) -> bool:
+    """判断是否为可重试的错误
+
+    Args:
+        error: 异常对象
+
+    Returns:
+        True表示可以重试，False表示不应重试
+    """
+    # 连接超时 - 可重试
+    if isinstance(error, requests.exceptions.ConnectTimeout):
+        return True
+    # 读取超时 - 可重试
+    if isinstance(error, requests.exceptions.ReadTimeout):
+        return True
+    # 连接错误（不包含DNS失败）- 可重试
+    if isinstance(error, requests.exceptions.ConnectionError):
+        error_str = str(error).lower()
+        # DNS解析失败不重试
+        if 'name or service not known' in error_str or 'getaddrinfo failed' in error_str:
+            return False
+        return True
+    # 服务器错误（5xx）- 通过HTTP状态码判断，这里不处理
+    return False
+
+
+def is_retryable_status_code(status_code: int) -> bool:
+    """判断HTTP状态码是否可重试
+
+    Args:
+        status_code: HTTP状态码
+
+    Returns:
+        True表示可以重试
+    """
+    # 5xx 服务器错误可重试
+    if 500 <= status_code < 600:
+        return True
+    # 429 Too Many Requests 可重试
+    if status_code == 429:
+        return True
+    return False
+
+
+def retry_request(request_func, max_attempts: int = MAX_RETRY_ATTEMPTS,
+                  description: str = "请求") -> requests.Response:
+    """带指数退避的请求重试包装器
+
+    Args:
+        request_func: 执行请求的函数，无参数
+        max_attempts: 最大尝试次数
+        description: 请求描述，用于日志
+
+    Returns:
+        响应对象
+
+    Raises:
+        最后一次失败的异常
+    """
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = request_func()
+
+            # 检查HTTP状态码是否需要重试
+            if is_retryable_status_code(response.status_code):
+                if attempt < max_attempts:
+                    delay = calculate_retry_delay(attempt)
+                    logger.warning(f"{description} 返回 {response.status_code}，第 {attempt}/{max_attempts} 次尝试，"
+                                   f"{delay:.1f} 秒后重试...")
+                    time.sleep(delay)
+                    continue
+
+            return response
+
+        except Exception as e:
+            last_error = e
+
+            # 判断是否可重试
+            if not is_retryable_error(e):
+                logger.error(f"{description} 发生不可重试错误: {e}")
+                raise
+
+            if attempt < max_attempts:
+                delay = calculate_retry_delay(attempt)
+                logger.warning(f"{description} 失败: {e}，第 {attempt}/{max_attempts} 次尝试，"
+                               f"{delay:.1f} 秒后重试...")
+                time.sleep(delay)
+            else:
+                logger.error(f"{description} 重试 {max_attempts} 次均失败: {e}")
+                raise
+
+    raise last_error
+
+
+def clean_download_directory(directory: str = DOWNLOAD_DIR, max_age_days: int = 7) -> int:
+    """清理下载目录中的旧文件
+
+    Args:
+        directory: 下载目录路径
+        max_age_days: 保留文件的最大天数
+
+    Returns:
+        删除的文件数量
+    """
+    deleted_count = 0
+    try:
+        dir_path = Path(directory)
+        if not dir_path.exists():
+            return 0
+
+        cutoff_time = time.time() - (max_age_days * 24 * 60 * 60)
+
+        for file_path in dir_path.glob('*'):
+            if file_path.is_file():
+                try:
+                    if file_path.stat().st_mtime < cutoff_time:
+                        file_path.unlink()
+                        deleted_count += 1
+                        logger.info(f"已删除过期文件: {file_path.name}")
+                except Exception as e:
+                    logger.warning(f"删除文件失败 {file_path}: {e}")
+
+        if deleted_count > 0:
+            logger.info(f"清理完成，共删除 {deleted_count} 个过期文件")
+    except Exception as e:
+        logger.error(f"清理下载目录失败: {e}")
+
+    return deleted_count
+
+
+def delete_file_safely(file_path: str) -> bool:
+    """安全删除文件
+
+    Args:
+        file_path: 文件路径
+
+    Returns:
+        是否删除成功
+    """
+    try:
+        path = Path(file_path)
+        if path.exists():
+            path.unlink()
+            logger.debug(f"已删除临时文件: {file_path}")
+            return True
+    except Exception as e:
+        logger.warning(f"删除文件失败 {file_path}: {e}")
+    return False
+
+
+def validate_excel_file(file_path: str) -> Tuple[bool, Optional[str]]:
+    """验证Excel文件完整性
+
+    Args:
+        file_path: Excel文件路径
+
+    Returns:
+        (是否有效, 错误信息)
+    """
+    try:
+        path = Path(file_path)
+
+        # 检查文件是否存在
+        if not path.exists():
+            return False, "文件不存在"
+
+        # 检查文件大小
+        file_size = path.stat().st_size
+        if file_size == 0:
+            return False, "文件大小为0"
+
+        if file_size < 100:  # Excel文件至少应该有几百字节
+            return False, f"文件大小异常: {file_size} bytes"
+
+        # 尝试用pandas打开验证格式
+        try:
+            df = pd.read_excel(file_path, nrows=1)
+            return True, None
+        except Exception as e:
+            return False, f"Excel格式无效: {e}"
+
+    except Exception as e:
+        return False, f"验证文件时发生错误: {e}"
 
 
 def report_auth_invalid(account_name: str) -> bool:
@@ -574,53 +850,60 @@ def load_cookies_from_api(account_name: str) -> Dict[str, Any]:
     print(f"🔍 正在从API获取账户 [{account_name}] 的cookie...")
 
     session = get_session()
-    response = session.post(
-        COOKIE_API_URL,
-        headers={'Content-Type': 'application/json'},
-        json={"name": account_name},
-        timeout=30,
-        proxies={'http': None, 'https': None}
-    )
-    response.raise_for_status()
-    result = response.json()
+    try:
+        response = session.post(
+            COOKIE_API_URL,
+            headers={'Content-Type': 'application/json'},
+            json={"name": account_name},
+            timeout=API_TIMEOUT,
+            proxies={'http': None, 'https': None}
+        )
+        response.raise_for_status()
 
-    if not result.get('success'):
-        raise Exception(f"API返回失败: {result.get('msg', '未知错误')}")
+        # 安全解析JSON
+        result, json_error = safe_json_parse(response, {})
+        if json_error:
+            raise Exception(f"API响应解析失败: {json_error}")
 
-    record = result.get('data', {})
-    if not record:
-        raise Exception(f"未找到账户 [{account_name}] 的cookie数据")
+        if not result.get('success'):
+            raise Exception(f"API返回失败: {result.get('msg', '未知错误')}")
 
-    # 解析cookies
-    cookies_json = record.get('cookies_json')
-    if isinstance(cookies_json, str):
-        cookies = json.loads(cookies_json)
-    else:
-        cookies = cookies_json or {}
+        record = result.get('data', {})
+        if not record:
+            raise Exception(f"未找到账户 [{account_name}] 的cookie数据")
 
-    # 解析mtgsig
-    mtgsig_data = record.get('mtgsig')
-    if isinstance(mtgsig_data, str):
-        mtgsig = mtgsig_data
-    elif isinstance(mtgsig_data, dict):
-        mtgsig = json.dumps(mtgsig_data)
-    else:
-        mtgsig = None
+        # 解析cookies
+        cookies_json = record.get('cookies_json')
+        if isinstance(cookies_json, str):
+            cookies = json.loads(cookies_json)
+        else:
+            cookies = cookies_json or {}
 
-    # 解析shop_info
-    shop_info = record.get('shop_info', {})
+        # 解析mtgsig
+        mtgsig_data = record.get('mtgsig')
+        if isinstance(mtgsig_data, str):
+            mtgsig = mtgsig_data
+        elif isinstance(mtgsig_data, dict):
+            mtgsig = json.dumps(mtgsig_data)
+        else:
+            mtgsig = None
 
-    # 获取templates_id
-    templates_id = record.get('templates_id')
+        # 解析shop_info
+        shop_info = record.get('shop_info', {})
 
-    print(f"✅ 成功加载 {len(cookies)} 个cookies")
+        # 获取templates_id
+        templates_id = record.get('templates_id')
 
-    return {
-        'cookies': cookies,
-        'mtgsig': mtgsig,
-        'shop_info': shop_info,
-        'templates_id': templates_id
-    }
+        print(f"✅ 成功加载 {len(cookies)} 个cookies")
+
+        return {
+            'cookies': cookies,
+            'mtgsig': mtgsig,
+            'shop_info': shop_info,
+            'templates_id': templates_id
+        }
+    finally:
+        session.close()
 
 
 def get_shop_ids(shop_info) -> List[int]:
@@ -853,6 +1136,8 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
     print(f"{'=' * 60}")
 
     result = {"task_name": table_name, "success": False, "record_count": 0, "error_message": "无"}
+    session = None
+    save_path = None  # 用于跟踪下载的临时文件
 
     try:
         disable_proxy()
@@ -879,9 +1164,7 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
 
         session = get_session()
 
-        # 报表下载重试机制（最多3次）
-        MAX_RETRY_ATTEMPTS = 3
-        RETRY_DELAY_SECONDS = 10
+        # 报表下载重试机制（使用指数退避）
         file_record = None
         last_error_message = ""
 
@@ -894,8 +1177,12 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
                 'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.1.1',
                 'mtgsig': generate_mtgsig(cookies, mtgsig)
             }
-            response = session.get(url, params=params, headers=headers, cookies=cookies, timeout=30)
-            resp_json = response.json()
+            response = session.get(url, params=params, headers=headers, cookies=cookies, timeout=API_TIMEOUT)
+
+            # 安全解析JSON响应
+            resp_json, json_error = safe_json_parse(response, {})
+            if json_error:
+                raise Exception(f"API响应解析失败: {json_error}")
             print(f"📊 请求响应: {resp_json}")
 
             # 检查是否登录失效（code 606 或 message 包含登录失效关键词）
@@ -910,12 +1197,13 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
             # 检查请求是否成功
             result_type = resp_json.get('data', {}).get('resultType')
             if result_type == 3:
-                # 服务异常，需要重试
+                # 服务异常，需要重试（使用指数退避）
                 last_error_message = f"服务异常 (resultType={result_type})"
                 print(f"⚠️ 第 {retry_attempt} 次尝试失败: {last_error_message}")
                 if retry_attempt < MAX_RETRY_ATTEMPTS:
-                    print(f"   等待 {RETRY_DELAY_SECONDS} 秒后重试...")
-                    time.sleep(RETRY_DELAY_SECONDS)
+                    delay = calculate_retry_delay(retry_attempt)
+                    print(f"   等待 {delay:.1f} 秒后重试...")
+                    time.sleep(delay)
                     continue
                 else:
                     raise Exception(f"报表下载重试 {MAX_RETRY_ATTEMPTS} 次均失败: {last_error_message}")
@@ -930,8 +1218,13 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
                 time.sleep(2)
                 list_url = "https://e.dianping.com/gateway/merchant/downloadcenter/list"
                 list_params = {'pageNo': 1, 'pageSize': 20, 'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.1.1', 'mtgsig': generate_mtgsig(cookies, mtgsig)}
-                list_resp = session.get(list_url, params=list_params, headers=headers, cookies=cookies, timeout=30)
-                list_data = list_resp.json()
+                list_resp = session.get(list_url, params=list_params, headers=headers, cookies=cookies, timeout=API_TIMEOUT)
+
+                # 安全解析JSON响应
+                list_data, json_error = safe_json_parse(list_resp, {})
+                if json_error:
+                    logger.warning(f"下载列表解析失败: {json_error}")
+                    continue
 
                 # 检查是否登录失效
                 list_code = list_data.get('code')
@@ -957,12 +1250,13 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
                 print(f"✅ 第 {retry_attempt} 次尝试成功，文件已就绪")
                 break  # 成功获取文件，跳出重试循环
             else:
-                # 文件未生成，需要重试
+                # 文件未生成，需要重试（使用指数退避）
                 last_error_message = "报表生成超时，文件未就绪"
                 print(f"⚠️ 第 {retry_attempt} 次尝试失败: {last_error_message}")
                 if retry_attempt < MAX_RETRY_ATTEMPTS:
-                    print(f"   等待 {RETRY_DELAY_SECONDS} 秒后重试...")
-                    time.sleep(RETRY_DELAY_SECONDS)
+                    delay = calculate_retry_delay(retry_attempt)
+                    print(f"   等待 {delay:.1f} 秒后重试...")
+                    time.sleep(delay)
                     continue
                 else:
                     raise Exception(f"报表下载重试 {MAX_RETRY_ATTEMPTS} 次均失败: {last_error_message}")
@@ -975,12 +1269,20 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
         save_path = str(Path(SAVE_DIR) / file_name)
 
         print(f"📥 正在下载文件...")
-        dl_resp = session.get(file_url, timeout=120, stream=True)
-        with open(save_path, 'wb') as f:
-            for chunk in dl_resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        dl_resp = session.get(file_url, timeout=DOWNLOAD_TIMEOUT, stream=True)
+        try:
+            with open(save_path, 'wb') as f:
+                for chunk in dl_resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        finally:
+            dl_resp.close()  # 确保关闭流式响应
         print(f"✅ 文件已保存到: {save_path}")
+
+        # 验证文件完整性
+        is_valid, validation_error = validate_excel_file(save_path)
+        if not is_valid:
+            raise Exception(f"下载的文件无效: {validation_error}")
 
         # 解析Excel
         print(f"\n📄 开始解析Excel文件")
@@ -1038,6 +1340,9 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
             result["record_count"] = success_count
             for shop_id, count in shop_record_counts.items():
                 log_success(account_name, shop_id, table_name, start_date, end_date, count)
+            # 任务成功后删除临时文件
+            if save_path:
+                delete_file_safely(save_path)
         else:
             result["error_message"] = f"部分上传失败: 成功{success_count}, 失败{fail_count}"
             for shop_id in shop_ids:
@@ -1053,6 +1358,11 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
         print(f"❌ 执行失败: {e}")
         log_failure(account_name, 0, table_name, start_date, end_date, str(e))
 
+    finally:
+        # 确保关闭Session
+        if session:
+            session.close()
+
     return result
 
 
@@ -1067,6 +1377,8 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
     print(f"{'=' * 60}")
 
     result = {"task_name": table_name, "success": False, "record_count": 0, "error_message": "无"}
+    session = None
+    save_path = None  # 用于跟踪下载的临时文件
 
     try:
         disable_proxy()
@@ -1109,8 +1421,10 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
             'mtgsig': generate_mtgsig(cookies, mtgsig)
         }
 
-        response = session.get(url, params=params, headers=headers, cookies=cookies, timeout=60)
-        resp_json = response.json()
+        response = session.get(url, params=params, headers=headers, cookies=cookies, timeout=API_TIMEOUT)
+        resp_json, json_error = safe_json_parse(response, {})
+        if json_error:
+            raise Exception(f"API响应解析失败: {json_error}")
         print(f"📊 请求响应: {resp_json}")
 
         # 检查是否登录失效（code 401 或 message 包含登录失效关键词）
@@ -1144,8 +1458,11 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
                 time.sleep(5)
                 hist_params = {'types': '3,9,10', 'beginDate': '', 'endDate': '', 'pageNum': 1, 'pageSize': 20,
                                'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.0.4', 'mtgsig': generate_mtgsig(cookies, mtgsig)}
-                hist_resp = session.get(history_url, params=hist_params, headers=headers, cookies=cookies, timeout=30)
-                hist_data = hist_resp.json()
+                hist_resp = session.get(history_url, params=hist_params, headers=headers, cookies=cookies, timeout=API_TIMEOUT)
+                hist_data, json_error = safe_json_parse(hist_resp, {})
+                if json_error:
+                    logger.warning(f"下载历史解析失败: {json_error}")
+                    continue
 
                 # 检查是否登录失效
                 hist_code = hist_data.get('code')
@@ -1179,12 +1496,20 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
         save_path = str(Path(SAVE_DIR) / file_name)
 
         print(f"📥 正在下载文件...")
-        dl_resp = session.get(file_url, timeout=120, stream=True)
-        with open(save_path, 'wb') as f:
-            for chunk in dl_resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        dl_resp = session.get(file_url, timeout=DOWNLOAD_TIMEOUT, stream=True)
+        try:
+            with open(save_path, 'wb') as f:
+                for chunk in dl_resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        finally:
+            dl_resp.close()  # 确保关闭流式响应
         print(f"✅ 文件已保存到: {save_path}")
+
+        # 验证文件完整性
+        is_valid, validation_error = validate_excel_file(save_path)
+        if not is_valid:
+            raise Exception(f"下载的文件无效: {validation_error}")
 
         # 上传数据
         print(f"\n📤 开始上传报表数据到: {UPLOAD_APIS[table_name]}")
@@ -1256,6 +1581,9 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
             result["record_count"] = success_count
             for shop_id in shop_ids_uploaded:
                 log_success(account_name, shop_id, table_name, start_date, end_date, success_count // len(shop_ids_uploaded) if shop_ids_uploaded else success_count)
+            # 任务成功后删除临时文件
+            if save_path:
+                delete_file_safely(save_path)
         else:
             result["error_message"] = f"部分上传失败: 成功{success_count}, 失败{fail_count}"
             for shop_id in shop_ids:
@@ -1270,6 +1598,11 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
         result["error_message"] = str(e)
         print(f"❌ 执行失败: {e}")
         log_failure(account_name, 0, table_name, start_date, end_date, str(e))
+
+    finally:
+        # 确保关闭Session
+        if session:
+            session.close()
 
     return result
 
@@ -2359,22 +2692,60 @@ class DianpingStoreStats:
             playwright_cookies.append(cookie)
         return playwright_cookies
 
-    def _check_login_status(self) -> bool:
-        """检查是否处于登录状态"""
-        try:
-            self.page.goto(
-                "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html",
-                wait_until='networkidle', timeout=15000
-            )
-            time.sleep(2)
-            current_url = self.page.url
-            if 'login' in current_url.lower():
-                return False
-            has_content = self.page.evaluate("() => document.body.textContent.length > 100")
-            return has_content
-        except Exception as e:
-            print(f"✗ 登录检测失败: {e}")
-            return False
+    def _check_login_status(self, max_retries: int = 2) -> Tuple[bool, str]:
+        """检查是否处于登录状态
+
+        Args:
+            max_retries: 最大重试次数
+
+        Returns:
+            (是否登录, 状态说明)
+            - (True, "logged_in") - 已登录
+            - (False, "not_logged_in") - 未登录（检测到登录页面）
+            - (False, "timeout") - 超时（可能是网络问题）
+            - (False, "error") - 其他错误
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 使用 domcontentloaded 而不是 networkidle，避免因持续网络请求导致超时
+                self.page.goto(
+                    "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html",
+                    wait_until='domcontentloaded',
+                    timeout=LOGIN_CHECK_TIMEOUT
+                )
+                time.sleep(2)
+
+                current_url = self.page.url
+                if 'login' in current_url.lower():
+                    logger.warning("检测到登录页面URL，账户登录状态已失效")
+                    return False, "not_logged_in"
+
+                has_content = self.page.evaluate("() => document.body.textContent.length > 100")
+                if has_content:
+                    return True, "logged_in"
+                else:
+                    logger.warning("页面内容为空，可能未正确加载")
+                    return False, "not_logged_in"
+
+            except Exception as e:
+                error_str = str(e).lower()
+                is_timeout = 'timeout' in error_str
+
+                if is_timeout:
+                    if attempt < max_retries:
+                        delay = calculate_retry_delay(attempt)
+                        logger.warning(f"登录检测超时，第 {attempt}/{max_retries} 次尝试，"
+                                       f"{delay:.1f} 秒后重试...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"登录检测超时，已重试 {max_retries} 次: {e}")
+                        return False, "timeout"
+                else:
+                    logger.error(f"登录检测失败: {e}")
+                    return False, "error"
+
+        return False, "error"
 
     def start_browser(self):
         """启动浏览器并登录"""
@@ -2415,7 +2786,8 @@ class DianpingStoreStats:
                     proxy=None, bypass_csp=True, ignore_https_errors=True
                 )
                 self.page = self.context.new_page()
-                if self._check_login_status():
+                is_logged_in, status = self._check_login_status()
+                if is_logged_in:
                     print(f"✓ 浏览器已启动（使用保存的状态）")
                     return
                 else:
@@ -2438,11 +2810,18 @@ class DianpingStoreStats:
             self.context.add_cookies(playwright_cookies)
             self.page = self.context.new_page()
 
-            if not self._check_login_status():
-                # 状态文件登录失败且API cookie登录也失败，上报账户失效状态
-                report_auth_invalid(self.account_name)
-                # 抛出 AuthInvalidError 异常，让调用者可以处理并上报到其他接口
-                raise AuthInvalidError("Cookie登录失败，账户登录状态已失效")
+            is_logged_in, status = self._check_login_status()
+            if not is_logged_in:
+                if status == "not_logged_in":
+                    # 确实是登录失效，上报账户失效状态
+                    report_auth_invalid(self.account_name)
+                    raise AuthInvalidError("Cookie登录失败，账户登录状态已失效")
+                elif status == "timeout":
+                    # 网络超时，不应该标记为登录失效
+                    raise Exception("登录检测超时，请检查网络连接后重试")
+                else:
+                    # 其他错误
+                    raise Exception(f"登录检测失败: {status}")
 
             self.context.storage_state(path=self.state_file)
             print(f"✓ 浏览器已启动（Cookie登录）")
@@ -2517,7 +2896,7 @@ class DianpingStoreStats:
         try:
             self.page.goto(
                 "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html",
-                wait_until='networkidle', timeout=30000
+                wait_until='load', timeout=BROWSER_PAGE_TIMEOUT
             )
             time.sleep(3)
 
@@ -2846,18 +3225,26 @@ class DianpingStoreStats:
                 product_name = item.get('productName', '')
                 if product_name == '综合推广':
                     balance = item.get('totalBalance', 0)
+                    # 确保balance是数字类型，去除可能的¥符号
+                    if isinstance(balance, str):
+                        balance = balance.replace('¥', '').replace('￥', '').replace(',', '').strip()
+                    balance = float(balance) if balance else 0.0
                     print(f"✅ 财务余额获取成功")
-                    print(f"   综合推广余额: ¥{balance}")
-                    return float(balance)
+                    print(f"   综合推广余额: {balance:.2f} 元")
+                    return balance
 
             # 如果没找到"综合推广"，返回第一个产品的余额
             if data_list:
                 first_item = data_list[0]
                 balance = first_item.get('totalBalance', 0)
+                # 确保balance是数字类型，去除可能的¥符号
+                if isinstance(balance, str):
+                    balance = balance.replace('¥', '').replace('￥', '').replace(',', '').strip()
+                balance = float(balance) if balance else 0.0
                 product_name = first_item.get('productName', '未知')
                 print(f"⚠️ 未找到'综合推广'，使用'{product_name}'的余额")
-                print(f"   余额: ¥{balance}")
-                return float(balance)
+                print(f"   余额: {balance:.2f} 元")
+                return balance
 
             return 0.0
 
@@ -2914,7 +3301,7 @@ class DianpingStoreStats:
                 "date": target_date
             }
             upload_data_list.append(data)
-            print(f"   📌 门店: {shop_name} ({shop_id}) - 打卡:{data['checkin_count']}, 下单排名:{data['order_user_rank']}, 广告单:{data['ad_order_count']}, 广告余额:¥{finance_balance}, 强制下线:{data['is_force_offline']}")
+            print(f"   📌 门店: {shop_name} ({shop_id}) - 打卡:{data['checkin_count']}, 下单排名:{data['order_user_rank']}, 广告单:{data['ad_order_count']}, 广告余额:{finance_balance:.2f}元, 强制下线:{data['is_force_offline']}")
 
         # 上传数据
         print(f"\n📤 上传数据到API: {upload_api_url}")
@@ -3115,23 +3502,60 @@ class PageDrivenTaskExecutor:
             playwright_cookies.append(cookie)
         return playwright_cookies
 
-    def _check_login_status(self) -> bool:
-        """检查是否处于登录状态"""
-        try:
-            self.page.goto(
-                "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html",
-                wait_until='networkidle',
-                timeout=15000
-            )
-            time.sleep(2)
-            current_url = self.page.url
-            if 'login' in current_url.lower():
-                return False
-            has_content = self.page.evaluate("() => document.body.textContent.length > 100")
-            return has_content
-        except Exception as e:
-            print(f"✗ 登录检测失败: {e}")
-            return False
+    def _check_login_status(self, max_retries: int = 2) -> Tuple[bool, str]:
+        """检查是否处于登录状态
+
+        Args:
+            max_retries: 最大重试次数
+
+        Returns:
+            (是否登录, 状态说明)
+            - (True, "logged_in") - 已登录
+            - (False, "not_logged_in") - 未登录（检测到登录页面）
+            - (False, "timeout") - 超时（可能是网络问题）
+            - (False, "error") - 其他错误
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 使用 domcontentloaded 而不是 networkidle，避免因持续网络请求导致超时
+                self.page.goto(
+                    "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html",
+                    wait_until='domcontentloaded',
+                    timeout=LOGIN_CHECK_TIMEOUT
+                )
+                time.sleep(2)
+
+                current_url = self.page.url
+                if 'login' in current_url.lower():
+                    logger.warning("检测到登录页面URL，账户登录状态已失效")
+                    return False, "not_logged_in"
+
+                has_content = self.page.evaluate("() => document.body.textContent.length > 100")
+                if has_content:
+                    return True, "logged_in"
+                else:
+                    logger.warning("页面内容为空，可能未正确加载")
+                    return False, "not_logged_in"
+
+            except Exception as e:
+                error_str = str(e).lower()
+                is_timeout = 'timeout' in error_str
+
+                if is_timeout:
+                    if attempt < max_retries:
+                        delay = calculate_retry_delay(attempt)
+                        logger.warning(f"登录检测超时，第 {attempt}/{max_retries} 次尝试，"
+                                       f"{delay:.1f} 秒后重试...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"登录检测超时，已重试 {max_retries} 次: {e}")
+                        return False, "timeout"
+                else:
+                    logger.error(f"登录检测失败: {e}")
+                    return False, "error"
+
+        return False, "error"
 
     def _install_browser(self):
         """自动安装Playwright浏览器"""
@@ -3187,7 +3611,8 @@ class PageDrivenTaskExecutor:
                     ignore_https_errors=True
                 )
                 self.page = self.context.new_page()
-                if self._check_login_status():
+                is_logged_in, status = self._check_login_status()
+                if is_logged_in:
                     print(f"✓ 浏览器已启动（使用保存的状态）")
                     return
                 else:
@@ -3212,10 +3637,18 @@ class PageDrivenTaskExecutor:
             self.context.add_cookies(playwright_cookies)
             self.page = self.context.new_page()
 
-            if not self._check_login_status():
-                report_auth_invalid(self.account_name)
-                # 抛出 AuthInvalidError 异常，让调用者可以处理并上报到其他接口
-                raise AuthInvalidError("Cookie登录失败，账户登录状态已失效")
+            is_logged_in, status = self._check_login_status()
+            if not is_logged_in:
+                if status == "not_logged_in":
+                    # 确实是登录失效，上报账户失效状态
+                    report_auth_invalid(self.account_name)
+                    raise AuthInvalidError("Cookie登录失败，账户登录状态已失效")
+                elif status == "timeout":
+                    # 网络超时，不应该标记为登录失效
+                    raise Exception("登录检测超时，请检查网络连接后重试")
+                else:
+                    # 其他错误
+                    raise Exception(f"登录检测失败: {status}")
 
             self.context.storage_state(path=self.state_file)
             print(f"✓ 浏览器已启动（Cookie登录）")
@@ -3230,17 +3663,18 @@ class PageDrivenTaskExecutor:
             self.playwright.stop()
         print("✓ 浏览器已关闭")
 
-    def navigate_to_page(self, page_key: str):
+    def navigate_to_page(self, page_key: str, max_retries: int = 2):
         """跳转到指定页面
 
         Args:
             page_key: 页面键名 (report, flow_analysis, review)
+            max_retries: 最大重试次数
         """
         page_url = PAGE_URLS.get(page_key)
         page_name = self.PAGE_NAME_MAP.get(page_key, page_key)
 
         if not page_url:
-            print(f"⚠️ 未找到页面URL: {page_key}")
+            logger.warning(f"未找到页面URL: {page_key}")
             return False
 
         print(f"\n{'=' * 60}")
@@ -3248,14 +3682,28 @@ class PageDrivenTaskExecutor:
         print(f"   URL: {page_url[:80]}...")
         print(f"{'=' * 60}")
 
-        try:
-            self.page.goto(page_url, wait_until='networkidle', timeout=30000)
-            time.sleep(3)  # 等待页面稳定
-            print(f"✅ 已跳转到 {page_name}")
-            return True
-        except Exception as e:
-            print(f"❌ 跳转失败: {e}")
-            return False
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 使用 load 而不是 networkidle，避免因持续网络请求导致超时
+                self.page.goto(page_url, wait_until='load', timeout=BROWSER_PAGE_TIMEOUT)
+                time.sleep(3)  # 等待页面稳定
+                print(f"✅ 已跳转到 {page_name}")
+                return True
+            except Exception as e:
+                error_str = str(e).lower()
+                is_timeout = 'timeout' in error_str
+
+                if is_timeout and attempt < max_retries:
+                    delay = calculate_retry_delay(attempt)
+                    logger.warning(f"页面加载超时，第 {attempt}/{max_retries} 次尝试，"
+                                   f"{delay:.1f} 秒后重试...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"跳转失败: {e}")
+                    return False
+
+        return False
 
     def execute_page_tasks(self, page_key: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
         """执行指定页面的所有任务
