@@ -3635,6 +3635,84 @@ class PageDrivenTaskExecutor:
 
         return False, "error"
 
+    def _try_relogin(self) -> bool:
+        """尝试使用API Cookie重新登录
+
+        当检测到Cookie失效时调用此方法尝试重新登录。
+
+        流程:
+        1. 关闭当前浏览器上下文
+        2. 删除旧状态文件
+        3. 重新从API获取Cookie
+        4. 使用新Cookie创建浏览器上下文
+        5. 检查登录状态
+        6. 如果成功，保存新状态文件并返回True
+        7. 如果失败，返回False
+
+        Returns:
+            bool: 重新登录是否成功
+        """
+        print("\n" + "=" * 60)
+        print("🔄 检测到Cookie失效，尝试使用API Cookie重新登录...")
+        print("=" * 60)
+
+        try:
+            # 1. 关闭当前浏览器上下文（保留browser实例）
+            if self.context:
+                try:
+                    self.context.close()
+                except:
+                    pass
+                self.context = None
+                self.page = None
+
+            # 2. 删除旧状态文件
+            if os.path.exists(self.state_file):
+                os.remove(self.state_file)
+                print(f"✓ 已删除旧状态文件: {self.state_file}")
+
+            # 3. 重新从API获取Cookie
+            print(f"🔍 正在从API重新获取账户 [{self.account_name}] 的Cookie...")
+            api_data = load_cookies_from_api(self.account_name)
+            self.cookies = api_data['cookies']
+            self.mtgsig = api_data['mtgsig']
+            print(f"✅ 成功加载 {len(self.cookies)} 个新cookies")
+
+            # 4. 使用新Cookie创建浏览器上下文
+            print("正在使用新Cookie登录...")
+            playwright_cookies = self._convert_cookies_to_playwright_format()
+            self.context = self.browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                proxy=None,
+                bypass_csp=True,
+                ignore_https_errors=True
+            )
+            self.context.add_cookies(playwright_cookies)
+            self.page = self.context.new_page()
+
+            # 5. 检查登录状态
+            is_logged_in, status = self._check_login_status()
+
+            if is_logged_in:
+                # 6. 登录成功，保存新状态文件
+                self.context.storage_state(path=self.state_file)
+                print(f"✅ 重新登录成功！已保存新状态文件")
+                # 重置登录失效标志
+                self.login_invalid = False
+                self.login_invalid_error = ""
+                return True
+            else:
+                # 7. 登录失败
+                print(f"❌ 重新登录失败: {status}")
+                return False
+
+        except Exception as e:
+            print(f"❌ 重新登录过程中发生错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def _install_browser(self):
         """自动安装Playwright浏览器"""
         print("\n⚠️ 检测到Chromium浏览器未安装，正在自动下载...")
@@ -3887,17 +3965,25 @@ class PageDrivenTaskExecutor:
             for page_key in PAGE_ORDER:
                 # 检查是否已经检测到登录失效
                 if self.login_invalid:
-                    print(f"\n🚨 已检测到Cookie失效，跳过后续所有任务")
-                    # 将剩余任务标记为失败
-                    for remaining_page_key in PAGE_ORDER[PAGE_ORDER.index(page_key):]:
-                        for task_name in PAGE_TASKS.get(remaining_page_key, []):
-                            all_results.append({
-                                "task_name": task_name,
-                                "success": False,
-                                "record_count": 0,
-                                "error_message": f"Cookie失效，任务跳过: {self.login_invalid_error}"
-                            })
-                    break
+                    print(f"\n🚨 已检测到Cookie失效，尝试重新登录...")
+                    # 尝试重新登录
+                    if self._try_relogin():
+                        print(f"✅ 重新登录成功，继续执行任务")
+                        # 重新登录成功，继续执行当前页面
+                    else:
+                        print(f"❌ 重新登录失败，停止后续所有任务")
+                        # 重新登录失败，上报并退出
+                        report_auth_invalid(self.account_name)
+                        # 将剩余任务标记为失败
+                        for remaining_page_key in PAGE_ORDER[PAGE_ORDER.index(page_key):]:
+                            for task_name in PAGE_TASKS.get(remaining_page_key, []):
+                                all_results.append({
+                                    "task_name": task_name,
+                                    "success": False,
+                                    "record_count": 0,
+                                    "error_message": f"Cookie失效且重新登录失败: {self.login_invalid_error}"
+                                })
+                        break
 
                 page_name = self.PAGE_NAME_MAP.get(page_key)
 
@@ -3905,20 +3991,38 @@ class PageDrivenTaskExecutor:
                 if not self.navigate_to_page(page_key):
                     # 检查是否是因为登录失效导致的跳转失败
                     if self.login_invalid:
-                        print(f"🚨 页面跳转失败，检测到Cookie已失效")
-                        # 上报登录失效并退出
-                        handle_auth_invalid(self.account_name, start_date, end_date,
-                                          "page_navigate", self.login_invalid_error)
-                        # 将所有任务标记为失败
-                        for remaining_page_key in PAGE_ORDER[PAGE_ORDER.index(page_key):]:
-                            for task_name in PAGE_TASKS.get(remaining_page_key, []):
-                                all_results.append({
-                                    "task_name": task_name,
-                                    "success": False,
-                                    "record_count": 0,
-                                    "error_message": f"Cookie失效: {self.login_invalid_error}"
-                                })
-                        break
+                        print(f"🚨 页面跳转失败，检测到Cookie已失效，尝试重新登录...")
+                        # 尝试重新登录
+                        if self._try_relogin():
+                            print(f"✅ 重新登录成功，重新跳转页面")
+                            # 重新登录成功，重新尝试跳转
+                            if not self.navigate_to_page(page_key):
+                                # 重新跳转仍然失败
+                                print(f"⚠️ 重新登录后页面跳转仍然失败，跳过 {page_name} 的任务")
+                                for task_name in PAGE_TASKS.get(page_key, []):
+                                    all_results.append({
+                                        "task_name": task_name,
+                                        "success": False,
+                                        "record_count": 0,
+                                        "error_message": f"重新登录后页面跳转失败"
+                                    })
+                                continue
+                            # 跳转成功，继续执行任务（不需要break或continue）
+                        else:
+                            print(f"❌ 重新登录失败，停止后续所有任务")
+                            # 重新登录失败，上报并退出
+                            handle_auth_invalid(self.account_name, start_date, end_date,
+                                              "page_navigate", self.login_invalid_error)
+                            # 将所有任务标记为失败
+                            for remaining_page_key in PAGE_ORDER[PAGE_ORDER.index(page_key):]:
+                                for task_name in PAGE_TASKS.get(remaining_page_key, []):
+                                    all_results.append({
+                                        "task_name": task_name,
+                                        "success": False,
+                                        "record_count": 0,
+                                        "error_message": f"Cookie失效且重新登录失败: {self.login_invalid_error}"
+                                    })
+                            break
                     else:
                         # 普通跳转失败，跳过该页面的任务
                         print(f"⚠️ 跳过 {page_name} 的任务")
@@ -3943,10 +4047,17 @@ class PageDrivenTaskExecutor:
                         self.login_invalid_error = error_msg
                         break
 
-                # 如果检测到登录失效，停止后续任务
+                # 如果检测到登录失效，尝试重新登录
                 if self.login_invalid:
-                    print(f"\n🚨 任务执行中检测到Cookie失效，停止后续任务")
-                    continue  # 跳到下一次循环，会被顶部的检查拦截
+                    print(f"\n🚨 任务执行中检测到Cookie失效，尝试重新登录...")
+                    # 尝试重新登录
+                    if self._try_relogin():
+                        print(f"✅ 重新登录成功，继续执行后续任务")
+                        # 重新登录成功，继续执行下一个页面的任务
+                    else:
+                        print(f"❌ 重新登录失败，停止后续任务")
+                        # 重新登录失败，将在下一次循环的顶部检查中处理
+                        continue
 
                 # 页面间随机延迟
                 random_delay(3, 5)
