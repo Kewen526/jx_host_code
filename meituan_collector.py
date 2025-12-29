@@ -155,6 +155,75 @@ PAGE_TASKS = {
 PAGE_ORDER = ["flow_analysis", "report", "review"]
 
 # ============================================================================
+# ★★★ 任务独立页面URL配置 ★★★
+# ============================================================================
+# 首页（Cookie登录后跳转）
+HOME_PAGE_URL = "https://e.dianping.com/app/merchant-platform/"
+
+# 每个任务对应的独立页面URL
+TASK_PAGE_URLS = {
+    "kewen_daily_report": "https://e.dianping.com/app/merchant-platform/0fb1bec0bade47d?iUrl=Ly9oNS5kaWFucGluZy5jb20vdmctcGMtYWR2aWNlL3JlcG9ydC1jZW50ZXIvaW5kZXguaHRtbA",
+    "promotion_daily_report": "https://e.dianping.com/app/merchant-platform/e77c7f630ee64ca?iUrl=Ly9oNS5kaWFucGluZy5jb20vYXBwL21lcmNoYW50LW1hbmFnZS1hZHZpY2UtcGMtc3RhdGljL2RpYWdub3Npcy1ob21lLmh0bWw#menuId=1",
+    "store_stats": "https://e.dianping.com/app/merchant-platform/468ccfd01240492?iUrl=Ly9oNS5kaWFucGluZy5jb20vdmctcGMtYWR2aWNlL2FkdmljZS1mbG93LWFuYWx5c2lzL2luZGV4Lmh0bWw",
+    "review_detail_dianping": "https://e.dianping.com/app/merchant-platform/7dfe97aa7164460?iUrl=Ly9lLmRpYW5waW5nLmNvbS92Zy1wbGF0Zm9ybS1yZXZpZXdtYW5hZ2Uvc2hvcC1jb21tZW50LWRwL2luZGV4Lmh0bWw",
+    "review_detail_meituan": "https://e.dianping.com/app/merchant-platform/27e9b6df520b47f?iUrl=Ly9lLmRpYW5waW5nLmNvbS92Zy1wbGF0Zm9ybS1yZXZpZXdtYW5hZ2Uvc2hvcC1jb21tZW50LW10L2luZGV4Lmh0bWw",
+    # 以下两个任务已禁用，无需跳转页面
+    "review_summary_dianping": None,
+    "review_summary_meituan": None,
+}
+
+# store_stats 内部数据采集页面URL
+STORE_STATS_PAGE_URLS = {
+    "flow_analysis": "https://e.dianping.com/app/merchant-platform/468ccfd01240492?iUrl=Ly9oNS5kaWFucGluZy5jb20vdmctcGMtYWR2aWNlL2FkdmljZS1mbG93LWFuYWx5c2lzL2luZGV4Lmh0bWw",
+    "rival_analysis": "https://e.dianping.com/app/merchant-platform/fe6031ae4f544c4?iUrl=Ly9lLmRpYW5waW5nLmNvbS9hcHAvbWVyY2hhbnQtd29ya2JlbmNoL2luZGV4Lmh0bWwjLw",
+    "trade_analysis": "https://e.dianping.com/app/merchant-platform/8b352a79fb3e44e?iUrl=Ly9oNS5kaWFucGluZy5jb20vYXBwL21lcmNoYW50LW1hbmFnZS1hZHZpY2UtcGMtc3RhdGljL2FkdmljZS10cmFkZS1hbmFseXNpcy5odG1s",
+    "notice_center": "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html",
+}
+
+# 任务页面名称映射（用于日志显示）
+TASK_PAGE_NAMES = {
+    "kewen_daily_report": "报表中心",
+    "promotion_daily_report": "推广中心",
+    "store_stats": "客流分析",
+    "review_detail_dianping": "点评评价",
+    "review_detail_meituan": "美团评价",
+    "review_summary_dianping": "点评评价汇总(已禁用)",
+    "review_summary_meituan": "美团评价汇总(已禁用)",
+}
+
+# store_stats 内部页面名称
+STORE_STATS_PAGE_NAMES = {
+    "flow_analysis": "客流分析",
+    "rival_analysis": "同行分析",
+    "trade_analysis": "交易分析",
+    "notice_center": "消息中心",
+}
+
+# ============================================================================
+# ★★★ 任务禁用开关 ★★★
+# ============================================================================
+TASK_DISABLED_FLAGS = {
+    "kewen_daily_report": False,
+    "promotion_daily_report": False,
+    "store_stats": False,
+    "review_detail_dianping": False,
+    "review_detail_meituan": False,
+    "review_summary_dianping": True,   # ⚠️ 已禁用
+    "review_summary_meituan": True,    # ⚠️ 已禁用
+}
+
+# 任务执行顺序（all模式下的执行顺序）
+TASK_EXECUTION_ORDER = [
+    "store_stats",
+    "kewen_daily_report",
+    "promotion_daily_report",
+    "review_detail_dianping",
+    "review_detail_meituan",
+    "review_summary_dianping",
+    "review_summary_meituan",
+]
+
+# ============================================================================
 # 共享签名存储 (store_stats执行后更新，供其他任务使用)
 # ============================================================================
 SHARED_SIGNATURE = {
@@ -843,6 +912,106 @@ def random_delay(min_seconds: float = 2, max_seconds: float = 5):
     delay = random.uniform(min_seconds, max_seconds)
     print(f"⏳ 反爬虫等待 {delay:.1f} 秒...")
     time.sleep(delay)
+
+
+# ============================================================================
+# ★★★ 门店权限处理函数 ★★★
+# ============================================================================
+def handle_shop_permission_issue(page) -> bool:
+    """处理门店权限问题，切换到全部门店
+
+    当页面出现"该门店无此功能操作权限"时，自动切换到全部门店
+
+    Args:
+        page: Playwright page 对象
+
+    Returns:
+        是否检测到并处理了权限问题
+    """
+    try:
+        # 检测是否出现"无权限"提示（等待2秒）
+        permission_text = page.locator("text=该门店无此功能操作权限")
+        if permission_text.is_visible(timeout=2000):
+            logger.warning("检测到门店权限问题，尝试切换到全部门店...")
+
+            try:
+                # 点击门店选择器展开（通过ID定位）
+                shop_selector = page.locator("#shopName")
+                if shop_selector.is_visible(timeout=2000):
+                    shop_selector.click()
+                    time.sleep(1.5)
+                    logger.info("已点击门店选择器")
+
+                    # 点击"全部门店"选项
+                    all_shops = page.locator("text=全部门店")
+                    if all_shops.is_visible(timeout=2000):
+                        all_shops.click()
+                        time.sleep(2)
+                        logger.info("已切换到全部门店")
+                        return True
+                    else:
+                        logger.warning("未找到'全部门店'选项")
+                else:
+                    logger.warning("未找到门店选择器")
+            except Exception as e:
+                logger.warning(f"门店切换操作失败: {e}")
+
+            # 即使切换失败也返回True，表示检测到了权限问题
+            return True
+
+    except Exception as e:
+        # 没有检测到权限问题，这是正常情况
+        pass
+
+    return False
+
+
+# ============================================================================
+# ★★★ 通用页面跳转函数 ★★★
+# ============================================================================
+def navigate_to_url(page, url: str, page_name: str, max_retries: int = 3) -> bool:
+    """跳转到指定URL
+
+    Args:
+        page: Playwright page 对象
+        url: 目标URL
+        page_name: 页面名称（用于日志）
+        max_retries: 最大重试次数
+
+    Returns:
+        是否跳转成功
+    """
+    logger.info(f"正在跳转到 [{page_name}]...")
+    logger.debug(f"URL: {url[:80]}...")
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            page.goto(url, wait_until='load', timeout=BROWSER_PAGE_TIMEOUT)
+
+            # 额外等待页面稳定
+            wait_time = random.uniform(3, 5)
+            logger.debug(f"等待页面稳定 {wait_time:.1f} 秒...")
+            time.sleep(wait_time)
+
+            # 处理门店权限问题
+            handle_shop_permission_issue(page)
+
+            logger.info(f"已跳转到 [{page_name}]")
+            return True
+
+        except Exception as e:
+            error_str = str(e).lower()
+            is_timeout = 'timeout' in error_str
+
+            if is_timeout and attempt < max_retries:
+                delay = calculate_retry_delay(attempt)
+                logger.warning(f"第 {attempt}/{max_retries} 次跳转超时，{delay:.1f} 秒后重试...")
+                time.sleep(delay)
+            else:
+                logger.error(f"跳转失败: {e}")
+                return False
+
+    return False
 
 
 def load_cookies_from_api(account_name: str) -> Dict[str, Any]:
@@ -2891,19 +3060,43 @@ class DianpingStoreStats:
         except:
             return 0
 
+    def _navigate_to_page(self, page_key: str) -> bool:
+        """跳转到指定页面（store_stats内部使用）
+
+        Args:
+            page_key: 页面键名 (flow_analysis, rival_analysis, trade_analysis, notice_center)
+
+        Returns:
+            是否跳转成功
+        """
+        if not self.page:
+            logger.debug("没有可用的浏览器页面，跳过页面跳转")
+            return True  # 没有page时仍然尝试执行
+
+        page_url = STORE_STATS_PAGE_URLS.get(page_key)
+        page_name = STORE_STATS_PAGE_NAMES.get(page_key, page_key)
+
+        if not page_url:
+            logger.warning(f"未找到页面URL: {page_key}")
+            return True
+
+        return navigate_to_url(self.page, page_url, page_name)
+
     def get_force_offline_data(self, target_date: str) -> Dict[str, int]:
         """获取强制下线数据（使用浏览器环境）"""
         print("\n📋 获取强制下线数据（浏览器模式）")
         print(f"   目标日期: {target_date}")
         force_offline_count = {}
 
-        try:
-            self.page.goto(
-                "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html",
-                wait_until='load', timeout=BROWSER_PAGE_TIMEOUT
-            )
-            time.sleep(3)
+        # 跳转到消息中心页面
+        self._navigate_to_page("notice_center")
+        random_delay(2, 4)
 
+        if not self.page:
+            logger.warning("没有可用的浏览器页面，跳过强制下线数据获取")
+            return force_offline_count
+
+        try:
             # 检查页面是否被重定向到登录页
             current_url = self.page.url.lower()
             if 'login' in current_url or 'passport' in current_url:
@@ -2987,6 +3180,11 @@ class DianpingStoreStats:
     def get_flow_data(self) -> Dict[str, int]:
         """获取客流数据（打卡数）"""
         print("\n📋 获取客流数据（打卡数）")
+
+        # 跳转到客流分析页面
+        self._navigate_to_page("flow_analysis")
+        random_delay(2, 4)
+
         url = "https://e.dianping.com/gateway/adviser/data"
         date_range = self._calculate_flow_date_range()
         print(f"   日期范围: {date_range}")
@@ -3047,6 +3245,11 @@ class DianpingStoreStats:
     def get_rival_rank_data(self) -> Dict[str, Dict[str, int]]:
         """获取同行排名数据"""
         print("\n📋 获取同行排名数据")
+
+        # 跳转到同行分析页面
+        self._navigate_to_page("rival_analysis")
+        random_delay(2, 4)
+
         rank_data = {}
 
         if not self.shop_region_info:
@@ -3135,6 +3338,11 @@ class DianpingStoreStats:
     def get_trade_data(self) -> Dict[str, int]:
         """获取商品交易数据（广告单）"""
         print("\n📋 获取商品交易数据（广告单）")
+
+        # 跳转到交易分析页面
+        self._navigate_to_page("trade_analysis")
+        random_delay(2, 4)
+
         ad_data = {}
         for shop in self.shop_list:
             ad_data[shop['shop_id']] = 0
@@ -3863,6 +4071,9 @@ class PageDrivenTaskExecutor:
                 except:
                     pass  # 获取页面内容失败，继续执行
 
+                # 处理门店权限问题（自动切换到全部门店）
+                handle_shop_permission_issue(self.page)
+
                 print(f"✅ 已跳转到 {page_name}")
                 return True
             except Exception as e:
@@ -3896,9 +4107,25 @@ class PageDrivenTaskExecutor:
         page_name = self.PAGE_NAME_MAP.get(page_key, page_key)
         results = []
 
-        print(f"\n📋 {page_name} 需要执行 {len(tasks)} 个任务: {', '.join(tasks)}")
+        # 过滤掉已禁用的任务
+        enabled_tasks = [t for t in tasks if not TASK_DISABLED_FLAGS.get(t, False)]
+        disabled_tasks = [t for t in tasks if TASK_DISABLED_FLAGS.get(t, False)]
 
-        for task_name in tasks:
+        print(f"\n📋 {page_name} 需要执行 {len(enabled_tasks)} 个任务: {', '.join(enabled_tasks)}")
+        if disabled_tasks:
+            print(f"   ⏭️ 已禁用任务: {', '.join(disabled_tasks)}")
+
+        # 为禁用的任务添加成功状态
+        for task_name in disabled_tasks:
+            logger.info(f"任务 {task_name} 已禁用，跳过执行（返回成功）")
+            results.append({
+                "task_name": task_name,
+                "success": True,
+                "record_count": 0,
+                "error_message": "任务已禁用(默认成功)"
+            })
+
+        for task_name in enabled_tasks:
             print(f"\n{'─' * 50}")
             print(f"▶ 开始执行任务: {task_name}")
             print(f"{'─' * 50}")
