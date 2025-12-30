@@ -89,6 +89,74 @@ GET_PLATFORM_ACCOUNT_API_URL = "http://8.146.210.145:3000/api/get_platform_accou
 SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 
 # ============================================================================
+# 报表模板相关API配置
+# ============================================================================
+TEMPLATE_LIST_API = "https://e.dianping.com/gateway/adviser/report/template/list"
+TEMPLATE_SAVE_API = "https://e.dianping.com/gateway/adviser/report/template/save"
+PLATFORM_ACCOUNTS_UPDATE_API = "http://8.146.210.145:3000/api/platform-accounts"
+
+# 报表中心页面URL（用于获取/创建模板时跳转）
+REPORT_CENTER_URL = "https://e.dianping.com/app/merchant-platform/0fb1bec0bade47d?iUrl=Ly9oNS5kaWFucGluZy5jb20vdmctcGMtYWR2aWNlL3JlcG9ydC1jZW50ZXIvaW5kZXguaHRtbA"
+
+# 创建报表模板时使用的固定指标列表
+TEMPLATE_METRIC_LIST = ",".join([
+    "basic_shop_dp_score",
+    "derived_shop_mt_score",
+    "basic_shop_operation_score",
+    "basic_shop_operation_grade",
+    "basic_acc_shop_cpc_charge",
+    "basic_shop_mem_publish_amount",
+    "basic_shop_commission_amount",
+    "basic_shop_commission_base_amount",
+    "basic_shop_view_uv",
+    "basic_shop_view_cnt",
+    "basic_shop_visit_uv",
+    "basic_shop_visit_cnt",
+    "derived_shop_click_rate",
+    "basic_shop_buy_uv",
+    "basic_shop_booking_uv_new",
+    "basic_shop_intent_uv_new",
+    "derived_shop_intent_rate_new",
+    "basic_shop_daily_favorite_user_cnt",
+    "basic_shop_favorite_user_cnt",
+    "basic_shop_flow_view_avg_page_stay_time",
+    "basic_acc_shop_cpc_view_cnt",
+    "basic_acc_shop_cpc_click_cnt",
+    "basic_shop_trade_csm_amt",
+    "basic_shop_trade_csm_amt_no_shop_share",
+    "basic_shop_trade_csm_cnt",
+    "basic_shop_trade_csm_order_cnt",
+    "basic_shop_trade_csm_uv",
+    "basic_shop_trade_csm_new_user_cnt",
+    "basic_shop_product_sale_cnt",
+    "basic_shop_product_sale_amt",
+    "basic_shop_ask_user_cnt",
+    "basic_shop_im_booking_uv",
+    "derived_shop_ask_booking_rate",
+    "derived_shop_ask_avg_reply_duration",
+    "derived_shop_ask_30sec_reply_rate",
+    "derived_shop_ask_5min_reply_rate",
+    "basic_shop_refund_order_amt",
+    "basic_shop_refund_order_cnt",
+    "basic_shop_refund_user_cnt",
+    "basic_shop_csmdisp_complain_cnt",
+    "basic_shop_cpst_order_cnt",
+    "basic_shop_review_chosen_new_cnt",
+    "basic_shop_review_good_new_cnt",
+    "basic_shop_review_good_mid_cnt",
+    "basic_shop_review_chosen_bad_new_cnt",
+    "derived_shop_review_chosen_bad_reply_rate",
+    "basic_shop_review_all_cnt",
+    "basic_shop_review_all_bad_cnt",
+    "basic_scan_pay_order_cnt",
+    "basic_scan_pay_amt",
+    "basic_scan_consume_amt",
+    "basic_scan_user_cnt",
+    "basic_scan_favorite_user_cnt",
+    "basic_scan_comment_user_cnt",
+])
+
+# ============================================================================
 # ★★★ 统一超时参数配置 ★★★
 # ============================================================================
 CONNECT_TIMEOUT = 10        # 连接建立超时（秒）
@@ -1201,6 +1269,442 @@ def generate_mtgsig(cookies: dict, mtgsig_from_api: str = None) -> str:
         "d1": "c9332725bc86a957c5b3185975b58e79"
     }
     return json.dumps(mtgsig)
+
+
+# ============================================================================
+# ★★★ 报表模板ID获取/创建功能 ★★★
+# ============================================================================
+def get_template_list(cookies: dict, mtgsig: str = None) -> Dict[str, Any]:
+    """获取报表模板列表
+
+    Args:
+        cookies: cookie字典
+        mtgsig: mtgsig签名（可选）
+
+    Returns:
+        包含模板列表的字典
+    """
+    print(f"\n📋 正在获取报表模板列表...")
+    print(f"   API地址: {TEMPLATE_LIST_API}")
+
+    session = get_session()
+
+    params = {
+        'source': '1',
+        'device': 'pc',
+        'offset': '0',
+        'limit': '19',
+        'keyword': '',
+        'yodaReady': 'h5',
+        'csecplatform': '4',
+        'csecversion': '4.1.1',
+        'mtgsig': generate_mtgsig(cookies, mtgsig)
+    }
+
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+        'Content-Type': 'application/json',
+        'Referer': 'https://e.dianping.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+
+    try:
+        response = session.get(
+            TEMPLATE_LIST_API,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=API_TIMEOUT,
+            proxies={'http': None, 'https': None}
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        print(f"   API响应状态: {response.status_code}")
+        print(f"   API响应码: {result.get('code')}")
+
+        return result
+
+    except requests.exceptions.RequestException as e:
+        print(f"   ❌ 获取模板列表失败: {e}")
+        return {'code': -1, 'error': str(e)}
+    finally:
+        session.close()
+
+
+def find_template_id(cookies: dict, mtgsig: str = None, template_names: List[str] = None) -> Dict[str, Any]:
+    """获取报表模板ID
+
+    优先查找顺序:
+    1. Kewen_data
+    2. hdp-all
+
+    Args:
+        cookies: cookie字典
+        mtgsig: mtgsig签名（可选）
+        template_names: 自定义模板名列表（可选）
+
+    Returns:
+        包含template_id和template_name的字典
+    """
+    # 默认查找的模板名顺序
+    default_names = ['Kewen_data', 'hdp-all']
+
+    if template_names:
+        search_names = template_names + default_names
+    else:
+        search_names = default_names
+
+    print(f"\n🔍 开始查找报表模板...")
+    print(f"   查找顺序: {' -> '.join(search_names)}")
+
+    # 获取模板列表
+    result = get_template_list(cookies, mtgsig)
+
+    if result.get('code') != 200:
+        error_msg = f"API返回错误码: {result.get('code')}, 消息: {result.get('msg', '未知')}"
+        print(f"   ❌ {error_msg}")
+        return {
+            'success': False,
+            'template_id': None,
+            'template_name': None,
+            'all_templates': [],
+            'error': error_msg
+        }
+
+    data = result.get('data', {})
+    template_list = data.get('list', [])
+
+    if not template_list:
+        print("   ⚠️ 未获取到任何报表模板")
+        return {
+            'success': False,
+            'template_id': None,
+            'template_name': None,
+            'all_templates': [],
+            'error': "未获取到任何报表模板"
+        }
+
+    # 打印所有可用模板
+    print(f"\n📊 可用的报表模板列表 (共 {len(template_list)} 个):")
+    print("   " + "-" * 50)
+    for idx, template in enumerate(template_list, 1):
+        print(f"   {idx:2}. ID: {template.get('id'):15} | 名称: {template.get('name')}")
+    print("   " + "-" * 50)
+
+    # 按优先级查找模板
+    for search_name in search_names:
+        for template in template_list:
+            if template.get('name') == search_name:
+                template_id = template.get('id')
+                template_name = template.get('name')
+                print(f"\n✅ 找到目标模板!")
+                print(f"   模板名称: {template_name}")
+                print(f"   模板ID: {template_id}")
+                return {
+                    'success': True,
+                    'template_id': template_id,
+                    'template_name': template_name,
+                    'all_templates': template_list
+                }
+
+    # 未找到目标模板
+    print(f"\n⚠️ 未找到目标模板: {search_names}")
+    return {
+        'success': False,
+        'template_id': None,
+        'template_name': None,
+        'all_templates': template_list,
+        'error': f"未找到以下模板: {', '.join(search_names)}"
+    }
+
+
+def create_report_template(cookies: dict, mtgsig: str, template_name: str = "Kewen_data") -> Dict[str, Any]:
+    """创建报表模板
+
+    Args:
+        cookies: cookie字典
+        mtgsig: mtgsig签名
+        template_name: 模板名称，默认为 "Kewen_data"
+
+    Returns:
+        包含创建结果的字典
+    """
+    print(f"\n📤 正在创建报表模板: {template_name}")
+    print(f"   API地址: {TEMPLATE_SAVE_API}")
+
+    if not mtgsig:
+        print("   ❌ 创建模板需要mtgsig签名")
+        return {
+            'success': False,
+            'template_id': None,
+            'template_name': template_name,
+            'error': "创建模板需要mtgsig签名"
+        }
+
+    session = get_session()
+
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://h5.dianping.com',
+        'Referer': 'https://h5.dianping.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+    }
+
+    params = {
+        'yodaReady': 'h5',
+        'csecplatform': '4',
+        'csecversion': '4.1.1',
+        'mtgsig': mtgsig
+    }
+
+    post_data = {
+        'source': '1',
+        'device': 'pc',
+        'name': template_name,
+        'platform': '0',
+        'relationObjectIds': '0',
+        'compareTypes': '',
+        'metricList': TEMPLATE_METRIC_LIST,
+        'dateType': 'day',
+        'dateSubType': '',
+        'statsType': 'shop',
+        'summaryType': 'shop'
+    }
+
+    try:
+        response = session.post(
+            TEMPLATE_SAVE_API,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            data=post_data,
+            timeout=API_TIMEOUT,
+            proxies={'http': None, 'https': None}
+        )
+
+        print(f"   HTTP状态码: {response.status_code}")
+        resp_json = response.json()
+        print(f"   响应内容: {json.dumps(resp_json, ensure_ascii=False)}")
+
+        if resp_json.get('code') == 200:
+            template_id = resp_json.get('data')
+            print(f"\n✅ 报表模板创建成功!")
+            print(f"   模板ID: {template_id}")
+            return {
+                'success': True,
+                'template_id': template_id,
+                'template_name': template_name
+            }
+        else:
+            error_msg = resp_json.get('msg', '未知错误')
+            print(f"\n❌ 创建失败: {error_msg}")
+            return {
+                'success': False,
+                'template_id': None,
+                'template_name': template_name,
+                'error': error_msg
+            }
+
+    except requests.exceptions.RequestException as e:
+        print(f"\n❌ 创建报表模板请求失败: {e}")
+        return {
+            'success': False,
+            'template_id': None,
+            'template_name': template_name,
+            'error': str(e)
+        }
+    finally:
+        session.close()
+
+
+def update_template_id_to_backend(account_name: str, templates_id: int) -> bool:
+    """将templates_id回写到后端数据库
+
+    Args:
+        account_name: 账户名称
+        templates_id: 模板ID
+
+    Returns:
+        是否更新成功
+    """
+    print(f"\n📤 正在回写 templates_id 到后端...")
+    print(f"   API地址: {PLATFORM_ACCOUNTS_UPDATE_API}")
+    print(f"   账户: {account_name}")
+    print(f"   templates_id: {templates_id}")
+
+    session = get_session()
+
+    try:
+        response = session.post(
+            PLATFORM_ACCOUNTS_UPDATE_API,
+            headers={'Content-Type': 'application/json'},
+            json={"account": account_name, "templates_id": templates_id},
+            timeout=API_TIMEOUT,
+            proxies={'http': None, 'https': None}
+        )
+
+        print(f"   HTTP状态码: {response.status_code}")
+        result = response.json()
+        print(f"   响应内容: {json.dumps(result, ensure_ascii=False)}")
+
+        if result.get('success'):
+            affected_rows = result.get('data', {}).get('affectedRows', 0)
+            print(f"✅ 回写成功! 影响行数: {affected_rows}")
+            return True
+        else:
+            print(f"❌ 回写失败: {result.get('msg', '未知错误')}")
+            return False
+
+    except requests.exceptions.RequestException as e:
+        print(f"❌ 回写请求失败: {e}")
+        return False
+    finally:
+        session.close()
+
+
+def ensure_template_id(account_name: str, cookies: dict, mtgsig: str) -> Optional[int]:
+    """确保获取到 templates_id
+
+    逻辑:
+    1. 先尝试从模板列表中查找 "Kewen_data" 或 "hdp-all"
+    2. 如果找不到，则创建名为 "Kewen_data" 的模板
+    3. 获取到 templates_id 后回写到后端
+
+    Args:
+        account_name: 账户名称
+        cookies: cookie字典
+        mtgsig: mtgsig签名
+
+    Returns:
+        templates_id (int) 或 None
+    """
+    print("\n" + "=" * 60)
+    print("🔧 开始获取/创建报表模板ID")
+    print("=" * 60)
+
+    # 步骤1: 尝试查找已有模板
+    find_result = find_template_id(cookies, mtgsig)
+
+    if find_result['success']:
+        template_id = find_result['template_id']
+        print(f"\n✅ 已找到现有模板，ID: {template_id}")
+
+        # 回写到后端
+        update_template_id_to_backend(account_name, template_id)
+
+        return template_id
+
+    # 步骤2: 未找到模板，需要创建
+    print("\n⚠️ 未找到目标模板，开始创建新模板...")
+    random_delay(1, 2)
+
+    create_result = create_report_template(cookies, mtgsig, "Kewen_data")
+
+    if create_result['success']:
+        template_id = create_result['template_id']
+        print(f"\n✅ 新模板创建成功，ID: {template_id}")
+
+        # 回写到后端
+        update_template_id_to_backend(account_name, template_id)
+
+        return template_id
+
+    # 创建也失败了
+    print("\n❌ 无法获取或创建报表模板ID")
+    return None
+
+
+def ensure_template_id_with_browser(account_name: str, cookies: dict,
+                                     mtgsig: str, headless: bool = True) -> Optional[int]:
+    """使用浏览器获取/创建报表模板ID（用于单任务模式）
+
+    流程：
+    1. 启动 Playwright 浏览器
+    2. 添加 cookies
+    3. 跳转到报表中心页面
+    4. 调用 ensure_template_id() 获取/创建
+    5. 关闭浏览器
+    6. 返回 templates_id
+
+    Args:
+        account_name: 账户名称
+        cookies: cookie字典
+        mtgsig: mtgsig签名
+        headless: 是否使用无头模式
+
+    Returns:
+        templates_id (int) 或 None
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        print("❌ Playwright未安装，无法使用浏览器模式获取模板ID")
+        return None
+
+    print("\n" + "=" * 60)
+    print("🌐 启动浏览器获取/创建报表模板ID")
+    print("=" * 60)
+
+    playwright = None
+    browser = None
+    context = None
+
+    try:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=headless, proxy=None)
+
+        # 转换cookies为Playwright格式
+        playwright_cookies = []
+        for name, value in cookies.items():
+            playwright_cookies.append({
+                'name': name,
+                'value': str(value),
+                'domain': '.dianping.com',
+                'path': '/'
+            })
+
+        context = browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            proxy=None,
+            bypass_csp=True,
+            ignore_https_errors=True
+        )
+        context.add_cookies(playwright_cookies)
+        page = context.new_page()
+
+        # 跳转到报表中心页面
+        print(f"\n📍 跳转到报表中心页面...")
+        print(f"   URL: {REPORT_CENTER_URL[:80]}...")
+        page.goto(REPORT_CENTER_URL, wait_until='networkidle', timeout=BROWSER_PAGE_TIMEOUT)
+        random_delay(2, 3)
+        print("   ✅ 页面加载完成")
+
+        # 调用 ensure_template_id 获取或创建模板ID
+        templates_id = ensure_template_id(account_name, cookies, mtgsig)
+
+        return templates_id
+
+    except Exception as e:
+        print(f"❌ 浏览器获取模板ID失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    finally:
+        # 关闭浏览器
+        try:
+            if context:
+                context.close()
+            if browser:
+                browser.close()
+            if playwright:
+                playwright.stop()
+            print("✓ 浏览器已关闭")
+        except Exception as e:
+            print(f"⚠️ 关闭浏览器时出错: {e}")
 
 
 # ============================================================================
@@ -4189,6 +4693,32 @@ class PageDrivenTaskExecutor:
             self._load_account_info()
             self.start_browser()
 
+            # ========== 检查并自动获取/创建 templates_id ==========
+            if not self.templates_id or self.templates_id == 0 or str(self.templates_id) == '0':
+                print("\n" + "=" * 60)
+                print("⚠️ templates_id 未获取到，开始自动获取/创建...")
+                print("=" * 60)
+
+                # 先跳转到报表中心页面
+                print(f"\n📍 跳转到报表中心页面...")
+                try:
+                    self.page.goto(REPORT_CENTER_URL, wait_until='networkidle', timeout=BROWSER_PAGE_TIMEOUT)
+                    random_delay(2, 3)
+                    print("   ✅ 页面加载完成")
+
+                    # 调用 ensure_template_id 获取或创建模板ID
+                    new_templates_id = ensure_template_id(self.account_name, self.cookies, self.mtgsig)
+
+                    if new_templates_id:
+                        self.templates_id = new_templates_id
+                        print(f"\n✅ 已成功获取 templates_id: {self.templates_id}")
+                    else:
+                        print("\n❌ 无法获取 templates_id，kewen_daily_report 任务可能失败")
+                except Exception as e:
+                    print(f"❌ 获取/创建模板ID失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+
             for page_key in PAGE_ORDER:
                 # 检查是否已经检测到登录失效
                 if self.login_invalid:
@@ -4650,19 +5180,32 @@ def execute_single_task(task_info: Dict[str, Any]) -> bool:
 
     templates_id = platform_account.get('templates_id')
     if templates_id == 0 or templates_id is None:
-        error_msg = "没有报表ID，无法继续执行，请确认是否在报表中心创建了：Kewen_data"
-        print(f"❌ {error_msg}")
-        print(f"   templates_id = {templates_id}")
-        # 同时上报到两个日志接口
-        log_failure(account_name, 0, "templates_id_check", start_date, end_date, error_msg)
-        upload_task_status_batch(account_name, start_date, end_date, [{
-            'task_name': 'templates_id_check',
-            'success': False,
-            'record_count': 0,
-            'error_message': error_msg
-        }])
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
-        return False
+        print("\n" + "=" * 60)
+        print("⚠️ templates_id 未获取到，开始自动获取/创建...")
+        print("=" * 60)
+
+        # 获取 cookies 用于调用模板API
+        cookies = platform_account.get('cookie', {})
+        mtgsig = platform_account.get('mtgsig')
+
+        # 使用浏览器跳转页面后获取/创建模板ID
+        templates_id = ensure_template_id_with_browser(account_name, cookies, mtgsig, headless=HEADLESS)
+
+        if templates_id:
+            print(f"✅ 已成功获取 templates_id: {templates_id}")
+        else:
+            error_msg = "无法获取或创建报表模板ID"
+            print(f"❌ {error_msg}")
+            # 同时上报到两个日志接口
+            log_failure(account_name, 0, "templates_id_check", start_date, end_date, error_msg)
+            upload_task_status_batch(account_name, start_date, end_date, [{
+                'task_name': 'templates_id_check',
+                'success': False,
+                'record_count': 0,
+                'error_message': error_msg
+            }])
+            report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+            return False
 
     print(f"   ✅ templates_id 检查通过: {templates_id}")
 
