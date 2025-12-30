@@ -94,6 +94,7 @@ SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 TEMPLATE_LIST_API = "https://e.dianping.com/gateway/adviser/report/template/list"
 TEMPLATE_SAVE_API = "https://e.dianping.com/gateway/adviser/report/template/save"
 PLATFORM_ACCOUNTS_UPDATE_API = "http://8.146.210.145:3000/api/platform-accounts"
+COOKIE_CONFIG_API_URL = "http://8.146.210.145:3000/api/cookie_config"
 
 # 报表中心页面URL（用于获取/创建模板时跳转）
 REPORT_CENTER_URL = "https://e.dianping.com/app/merchant-platform/0fb1bec0bade47d?iUrl=Ly9oNS5kaWFucGluZy5jb20vdmctcGMtYWR2aWNlL3JlcG9ydC1jZW50ZXIvaW5kZXguaHRtbA"
@@ -1524,43 +1525,85 @@ def create_report_template(cookies: dict, mtgsig: str, template_name: str = "Kew
 def update_template_id_to_backend(account_name: str, templates_id: int) -> bool:
     """将templates_id回写到后端数据库
 
+    同时调用两个API：
+    1. /api/platform-accounts - 原有API
+    2. /api/cookie_config - 新增API
+
     Args:
         account_name: 账户名称
         templates_id: 模板ID
 
     Returns:
-        是否更新成功
+        是否更新成功（两个API都成功才返回True）
     """
     print(f"\n📤 正在回写 templates_id 到后端...")
-    print(f"   API地址: {PLATFORM_ACCOUNTS_UPDATE_API}")
     print(f"   账户: {account_name}")
     print(f"   templates_id: {templates_id}")
 
     session = get_session()
+    success_count = 0
 
     try:
-        response = session.post(
-            PLATFORM_ACCOUNTS_UPDATE_API,
-            headers={'Content-Type': 'application/json'},
-            json={"account": account_name, "templates_id": templates_id},
-            timeout=API_TIMEOUT,
-            proxies={'http': None, 'https': None}
-        )
+        # ========== 调用API 1: /api/platform-accounts ==========
+        print(f"\n   [1/2] 调用 {PLATFORM_ACCOUNTS_UPDATE_API}")
+        try:
+            response1 = session.post(
+                PLATFORM_ACCOUNTS_UPDATE_API,
+                headers={'Content-Type': 'application/json'},
+                json={"account": account_name, "templates_id": templates_id},
+                timeout=API_TIMEOUT,
+                proxies={'http': None, 'https': None}
+            )
 
-        print(f"   HTTP状态码: {response.status_code}")
-        result = response.json()
-        print(f"   响应内容: {json.dumps(result, ensure_ascii=False)}")
+            print(f"      HTTP状态码: {response1.status_code}")
+            result1 = response1.json()
+            print(f"      响应内容: {json.dumps(result1, ensure_ascii=False)}")
 
-        if result.get('success'):
-            affected_rows = result.get('data', {}).get('affectedRows', 0)
-            print(f"✅ 回写成功! 影响行数: {affected_rows}")
+            if result1.get('success'):
+                affected_rows = result1.get('data', {}).get('affectedRows', 0)
+                print(f"      ✅ 成功! 影响行数: {affected_rows}")
+                success_count += 1
+            else:
+                print(f"      ❌ 失败: {result1.get('msg', '未知错误')}")
+        except requests.exceptions.RequestException as e:
+            print(f"      ❌ 请求失败: {e}")
+
+        # ========== 调用API 2: /api/cookie_config ==========
+        print(f"\n   [2/2] 调用 {COOKIE_CONFIG_API_URL}")
+        try:
+            response2 = session.post(
+                COOKIE_CONFIG_API_URL,
+                headers={'Content-Type': 'application/json'},
+                json={"name": account_name, "templates_id": templates_id},
+                timeout=API_TIMEOUT,
+                proxies={'http': None, 'https': None}
+            )
+
+            print(f"      HTTP状态码: {response2.status_code}")
+            result2 = response2.json()
+            print(f"      响应内容: {json.dumps(result2, ensure_ascii=False)}")
+
+            if result2.get('success') or response2.status_code == 200:
+                print(f"      ✅ 成功!")
+                success_count += 1
+            else:
+                print(f"      ❌ 失败: {result2.get('msg', '未知错误')}")
+        except requests.exceptions.RequestException as e:
+            print(f"      ❌ 请求失败: {e}")
+
+        # 汇总结果
+        if success_count == 2:
+            print(f"\n✅ 回写完成! 2个API均成功")
             return True
+        elif success_count == 1:
+            print(f"\n⚠️ 回写部分成功 (1/2)")
+            return True  # 至少有一个成功也返回True
         else:
-            print(f"❌ 回写失败: {result.get('msg', '未知错误')}")
+            print(f"\n❌ 回写失败! 2个API均失败")
             return False
 
-    except requests.exceptions.RequestException as e:
-        print(f"❌ 回写请求失败: {e}")
+    except Exception as e:
+        print(f"❌ 回写过程异常: {e}")
         return False
     finally:
         session.close()
