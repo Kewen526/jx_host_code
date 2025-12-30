@@ -5182,6 +5182,14 @@ def execute_single_task(task_info: Dict[str, Any]) -> bool:
     end_date = END_DATE
     task = TASK
 
+    # 评价详细任务使用近7天日期（昨天往前推6天）
+    if task in ['review_detail_dianping', 'review_detail_meituan']:
+        today = datetime.now()
+        end_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")  # 昨天
+        start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")  # 昨天往前6天
+        START_DATE = start_date
+        END_DATE = end_date
+
     print(f"\n{'=' * 80}")
     print("📌 任务配置")
     print(f"{'=' * 80}")
