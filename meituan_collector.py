@@ -94,7 +94,7 @@ SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 TEMPLATE_LIST_API = "https://e.dianping.com/gateway/adviser/report/template/list"
 TEMPLATE_SAVE_API = "https://e.dianping.com/gateway/adviser/report/template/save"
 PLATFORM_ACCOUNTS_UPDATE_API = "http://8.146.210.145:3000/api/platform-accounts"
-COOKIE_CONFIG_API_URL = "http://8.146.210.145:3000/api/cookie_config"
+TEMPLATES_ID_UPDATE_API_URL = "https://kewenai.asia/api/up/templates_id"
 
 # 报表中心页面URL（用于获取/创建模板时跳转）
 REPORT_CENTER_URL = "https://e.dianping.com/app/merchant-platform/0fb1bec0bade47d?iUrl=Ly9oNS5kaWFucGluZy5jb20vdmctcGMtYWR2aWNlL3JlcG9ydC1jZW50ZXIvaW5kZXguaHRtbA"
@@ -1568,11 +1568,11 @@ def update_template_id_to_backend(account_name: str, templates_id: int) -> bool:
         except requests.exceptions.RequestException as e:
             print(f"      ❌ 请求失败: {e}")
 
-        # ========== 调用API 2: /api/cookie_config ==========
-        print(f"\n   [2/2] 调用 {COOKIE_CONFIG_API_URL}")
+        # ========== 调用API 2: /api/up/templates_id ==========
+        print(f"\n   [2/2] 调用 {TEMPLATES_ID_UPDATE_API_URL}")
         try:
             response2 = session.post(
-                COOKIE_CONFIG_API_URL,
+                TEMPLATES_ID_UPDATE_API_URL,
                 headers={'Content-Type': 'application/json'},
                 json={"name": account_name, "templates_id": templates_id},
                 timeout=API_TIMEOUT,
@@ -1844,8 +1844,15 @@ def kewen_is_valid_coupon_type(data):
     return coupon_code_type == '全部码'
 
 
-def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    """执行kewen_daily_report任务"""
+def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, templates_id: Optional[int] = None) -> Dict[str, Any]:
+    """执行kewen_daily_report任务
+
+    Args:
+        account_name: 账户名称
+        start_date: 开始日期
+        end_date: 结束日期
+        templates_id: 报表模板ID（可选，如果传入则优先使用，不再从API重新获取）
+    """
     table_name = "kewen_daily_report"
     print(f"\n{'=' * 60}")
     print(f"📊 {table_name}")
@@ -1864,7 +1871,15 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str) ->
         cookies = api_data['cookies']
         mtgsig = api_data['mtgsig']
         shop_info = api_data['shop_info']
-        templates_id = api_data['templates_id']
+
+        # 如果外部传入了 templates_id，优先使用外部传入的值
+        if templates_id:
+            print(f"📌 使用外部传入的 templates_id: {templates_id}")
+        else:
+            # 否则从API数据获取
+            templates_id = api_data['templates_id']
+            if templates_id:
+                print(f"📌 从API获取 templates_id: {templates_id}")
 
         if not templates_id:
             raise Exception("未获取到报表模板ID")
@@ -4682,6 +4697,9 @@ class PageDrivenTaskExecutor:
                 # 对于 store_stats 任务，传递当前 page 对象（页面驱动模式）
                 if task_name == 'store_stats':
                     result = task_func(self.account_name, start_date, end_date, external_page=self.page)
+                # 对于 kewen_daily_report 任务，传递已获取的 templates_id（避免重新从API获取空值）
+                elif task_name == 'kewen_daily_report':
+                    result = task_func(self.account_name, start_date, end_date, templates_id=self.templates_id)
                 else:
                     result = task_func(self.account_name, start_date, end_date)
                 results.append(result)
