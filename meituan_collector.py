@@ -1668,10 +1668,11 @@ def ensure_template_id_with_browser(account_name: str, cookies: dict,
     流程：
     1. 启动 Playwright 浏览器
     2. 添加 cookies
-    3. 跳转到报表中心页面
-    4. 调用 ensure_template_id() 获取/创建
-    5. 关闭浏览器
-    6. 返回 templates_id
+    3. 检查登录状态（重要：必须先验证登录再执行后续操作）
+    4. 登录有效 → 跳转到报表中心页面
+    5. 调用 ensure_template_id() 获取/创建
+    6. 关闭浏览器
+    7. 返回 templates_id
 
     Args:
         account_name: 账户名称
@@ -1718,7 +1719,43 @@ def ensure_template_id_with_browser(account_name: str, cookies: dict,
         context.add_cookies(playwright_cookies)
         page = context.new_page()
 
-        # 跳转到报表中心页面
+        # ========== 先检查登录状态 ==========
+        print(f"\n🔐 检查登录状态...")
+        login_check_url = "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html"
+        try:
+            page.goto(login_check_url, wait_until='domcontentloaded', timeout=30000)
+            time.sleep(2)
+
+            current_url = page.url
+            # 检查是否被重定向到登录页
+            if 'login' in current_url.lower():
+                print(f"   ❌ 检测到登录失效（重定向到登录页）")
+                print(f"   当前URL: {current_url}")
+                # 上报登录失效状态
+                report_auth_invalid(account_name)
+                return None
+
+            # 检查页面是否有内容（防止空页面）
+            has_content = page.evaluate("() => document.body.textContent.length > 100")
+            if not has_content:
+                print(f"   ❌ 检测到登录失效（页面内容为空）")
+                # 上报登录失效状态
+                report_auth_invalid(account_name)
+                return None
+
+            print(f"   ✅ 登录状态有效")
+
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'timeout' in error_msg:
+                print(f"   ⚠️ 登录检测超时，继续尝试...")
+            else:
+                print(f"   ❌ 登录检测失败: {e}")
+                # 上报登录失效状态
+                report_auth_invalid(account_name)
+                return None
+
+        # ========== 登录有效，跳转到报表中心页面 ==========
         print(f"\n📍 跳转到报表中心页面...")
         print(f"   URL: {REPORT_CENTER_URL[:80]}...")
         page.goto(REPORT_CENTER_URL, wait_until='networkidle', timeout=BROWSER_PAGE_TIMEOUT)
