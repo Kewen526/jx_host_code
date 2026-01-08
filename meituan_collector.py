@@ -75,7 +75,6 @@ DOWNLOAD_DIR = "/home/meituan/data/downloads"       # 下载文件目录
 # ============================================================================
 # API配置 (一般不需要修改)
 # ============================================================================
-COOKIE_API_URL = "http://8.146.210.145:3000/api/get_namecookies"
 PLATFORM_ACCOUNTS_API_URL = "http://8.146.210.145:3000/api/get_platform_accounts"
 LOG_API_URL = "http://8.146.210.145:3000/api/log"
 AUTH_STATUS_API_URL = "http://8.146.210.145:3000/api/post/platform_accounts"  # 登录状态上报API
@@ -1084,15 +1083,18 @@ def navigate_to_url(page, url: str, page_name: str, max_retries: int = 3) -> boo
 
 
 def load_cookies_from_api(account_name: str) -> Dict[str, Any]:
-    """从API加载cookies和相关信息"""
+    """从API加载cookies和相关信息
+
+    使用 /api/get_platform_account 获取账户信息
+    """
     print(f"🔍 正在从API获取账户 [{account_name}] 的cookie...")
 
     session = get_session()
     try:
         response = session.post(
-            COOKIE_API_URL,
+            GET_PLATFORM_ACCOUNT_API_URL,
             headers={'Content-Type': 'application/json'},
-            json={"name": account_name},
+            json={"account": account_name},
             timeout=API_TIMEOUT,
             proxies={'http': None, 'https': None}
         )
@@ -1104,18 +1106,18 @@ def load_cookies_from_api(account_name: str) -> Dict[str, Any]:
             raise Exception(f"API响应解析失败: {json_error}")
 
         if not result.get('success'):
-            raise Exception(f"API返回失败: {result.get('msg', '未知错误')}")
+            raise Exception(f"API返回失败: {result.get('message', '未知错误')}")
 
         record = result.get('data', {})
         if not record:
             raise Exception(f"未找到账户 [{account_name}] 的cookie数据")
 
-        # 解析cookies
-        cookies_json = record.get('cookies_json')
-        if isinstance(cookies_json, str):
-            cookies = json.loads(cookies_json)
+        # 解析cookies（字段名: cookie）
+        cookie_data = record.get('cookie')
+        if isinstance(cookie_data, str):
+            cookies = json.loads(cookie_data)
         else:
-            cookies = cookies_json or {}
+            cookies = cookie_data or {}
 
         # 解析mtgsig
         mtgsig_data = record.get('mtgsig')
@@ -1126,8 +1128,8 @@ def load_cookies_from_api(account_name: str) -> Dict[str, Any]:
         else:
             mtgsig = None
 
-        # 解析shop_info
-        shop_info = record.get('shop_info', {})
+        # 解析shop_info（字段名: stores_json）
+        shop_info = record.get('stores_json', [])
 
         # 获取templates_id
         templates_id = record.get('templates_id')
@@ -1145,15 +1147,25 @@ def load_cookies_from_api(account_name: str) -> Dict[str, Any]:
 
 
 def get_shop_ids(shop_info) -> List[int]:
-    """从shop_info提取门店ID列表"""
+    """从shop_info提取门店ID列表
+
+    支持两种字段名格式：
+    - shop_id: stores_json格式（来自get_platform_account）
+    - shopId: 旧格式（兼容）
+    """
     shop_ids = []
     if shop_info:
         if isinstance(shop_info, list):
             for shop in shop_info:
-                if isinstance(shop, dict) and shop.get('shopId'):
-                    shop_ids.append(int(shop.get('shopId')))
-        elif isinstance(shop_info, dict) and shop_info.get('shopId'):
-            shop_ids.append(int(shop_info.get('shopId')))
+                if isinstance(shop, dict):
+                    # 优先使用shop_id，兼容shopId
+                    shop_id = shop.get('shop_id') or shop.get('shopId')
+                    if shop_id:
+                        shop_ids.append(int(shop_id))
+        elif isinstance(shop_info, dict):
+            shop_id = shop_info.get('shop_id') or shop_info.get('shopId')
+            if shop_id:
+                shop_ids.append(int(shop_id))
     return shop_ids if shop_ids else [0]
 
 
