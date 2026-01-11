@@ -41,7 +41,7 @@ except ImportError:
 # 浏览器池配置
 MAX_BROWSERS = 10                    # 最大Browser数量
 MAX_CONTEXTS_PER_BROWSER = 15        # 每个Browser最大Context数量
-BROWSER_TYPE = "webkit"              # 浏览器类型: webkit / chromium / firefox
+BROWSER_TYPE = "chromium"            # 浏览器类型: webkit / chromium / firefox
 
 # 保活配置
 KEEPALIVE_INTERVAL = 30 * 60         # 保活间隔（秒）：30分钟
