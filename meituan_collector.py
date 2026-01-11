@@ -34,6 +34,27 @@ except ImportError:
     print("⚠️ 未安装playwright，store_stats任务将不可用")
     print("   安装方法: pip install playwright && playwright install chromium")
 
+# 浏览器池模块导入
+try:
+    from browser_pool import (
+        initialize_browser_pool,
+        start_keepalive_service,
+        shutdown_all as shutdown_browser_pool,
+        get_browser_pool,
+        account_lock_manager,
+        cookie_upload_queue,
+        fetch_task_with_server_ip,
+        get_public_ip,
+        get_cached_ip,
+        BrowserPoolManager,
+        KeepaliveService,
+    )
+    BROWSER_POOL_AVAILABLE = True
+except ImportError as e:
+    BROWSER_POOL_AVAILABLE = False
+    print(f"⚠️ 浏览器池模块未加载: {e}")
+    print("   将使用传统模式运行")
+
 
 # ============================================================================
 # ★★★ 在这里修改配置参数 ★★★
@@ -64,6 +85,13 @@ DEV_MODE = True                     # 开发模式: True=24小时运行, False=�
 WORK_START_HOUR = 8                 # 工作开始时间 (仅DEV_MODE=False时生效)
 WORK_END_HOUR = 23                  # 工作结束时间 (仅DEV_MODE=False时生效)
 NO_TASK_WAIT_SECONDS = 300          # 无任务时等待秒数 (5分钟)
+
+# ============================================================================
+# ★★★ 浏览器池模式配置 ★★★
+# ============================================================================
+USE_BROWSER_POOL = True             # 是否使用浏览器池模式 (推荐开启)
+                                    # True: 使用浏览器池 + 保活机制
+                                    # False: 传统模式，每次任务新建浏览器
 
 # ============================================================================
 # ★★★ 路径配置 (服务器部署时使用绝对路径) ★★★
@@ -1674,16 +1702,21 @@ def ensure_template_id(account_name: str, cookies: dict, mtgsig: str) -> Optiona
 
 
 def ensure_template_id_with_browser(account_name: str, cookies: dict,
-                                     mtgsig: str, headless: bool = True) -> Optional[int]:
-    """使用浏览器获取/创建报表模板ID（用于单任务模式）
+                                     mtgsig: str, headless: bool = True,
+                                     browser_pool: 'BrowserPoolManager' = None) -> Optional[int]:
+    """使用浏览器获取/创建报表模板ID
+
+    支持两种模式：
+    1. 浏览器池模式：传入 browser_pool，复用池中的 Context（避免 Playwright 实例冲突）
+    2. 单任务模式：不传 browser_pool，创建独立的 Playwright 实例
 
     流程：
-    1. 启动 Playwright 浏览器
-    2. 添加 cookies
-    3. 检查登录状态（重要：必须先验证登录再执行后续操作）
+    1. 获取/创建浏览器页面
+    2. 添加 cookies（单任务模式）
+    3. 检查登录状态
     4. 登录有效 → 跳转到报表中心页面
     5. 调用 ensure_template_id() 获取/创建
-    6. 关闭浏览器
+    6. 关闭浏览器（单任务模式）
     7. 返回 templates_id
 
     Args:
@@ -1691,6 +1724,7 @@ def ensure_template_id_with_browser(account_name: str, cookies: dict,
         cookies: cookie字典
         mtgsig: mtgsig签名
         headless: 是否使用无头模式
+        browser_pool: 浏览器池管理器（可选）
 
     Returns:
         templates_id (int) 或 None
@@ -1703,6 +1737,68 @@ def ensure_template_id_with_browser(account_name: str, cookies: dict,
     print("🌐 启动浏览器获取/创建报表模板ID")
     print("=" * 60)
 
+    # 浏览器池模式
+    if browser_pool:
+        print("   使用浏览器池模式")
+        try:
+            # 从浏览器池获取 Context
+            wrapper = browser_pool.get_context(account_name, cookies)
+            if not wrapper or not wrapper.page:
+                print("❌ 无法从浏览器池获取页面")
+                return None
+
+            page = wrapper.page
+
+            # ========== 检查登录状态 ==========
+            print(f"\n🔐 检查登录状态...")
+            login_check_url = "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html"
+            try:
+                page.goto(login_check_url, wait_until='domcontentloaded', timeout=30000)
+                time.sleep(2)
+
+                current_url = page.url
+                if 'login' in current_url.lower():
+                    print(f"   ❌ 检测到登录失效（重定向到登录页）")
+                    print(f"   当前URL: {current_url}")
+                    report_auth_invalid(account_name)
+                    return None
+
+                has_content = page.evaluate("() => document.body.textContent.length > 100")
+                if not has_content:
+                    print(f"   ❌ 检测到登录失效（页面内容为空）")
+                    report_auth_invalid(account_name)
+                    return None
+
+                print(f"   ✅ 登录状态有效")
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                if 'timeout' in error_msg:
+                    print(f"   ⚠️ 登录检测超时，继续尝试...")
+                else:
+                    print(f"   ❌ 登录检测失败: {e}")
+                    report_auth_invalid(account_name)
+                    return None
+
+            # ========== 跳转到报表中心页面 ==========
+            print(f"\n📍 跳转到报表中心页面...")
+            print(f"   URL: {REPORT_CENTER_URL[:80]}...")
+            page.goto(REPORT_CENTER_URL, wait_until='networkidle', timeout=BROWSER_PAGE_TIMEOUT)
+            random_delay(2, 3)
+            print("   ✅ 页面加载完成")
+
+            # 调用 ensure_template_id 获取或创建模板ID
+            templates_id = ensure_template_id(account_name, cookies, mtgsig)
+            return templates_id
+
+        except Exception as e:
+            print(f"❌ 浏览器池模式获取模板ID失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    # 单任务模式（创建独立 Playwright 实例）
+    print("   使用单任务模式")
     playwright = None
     browser = None
     context = None
@@ -4333,16 +4429,22 @@ class PageDrivenTaskExecutor:
         "review": "评价页面",
     }
 
-    def __init__(self, account_name: str, headless: bool = True):
+    def __init__(self, account_name: str, headless: bool = True, browser_pool: 'BrowserPoolManager' = None):
         """初始化
 
         Args:
             account_name: 账户名称
             headless: 是否使用无头模式
+            browser_pool: 浏览器池管理器（可选，如果提供则使用浏览器池模式）
         """
         self.account_name = account_name
         self.headless = headless
         self.state_file = os.path.join(STATE_DIR, f'dianping_state_{account_name}.json')
+
+        # 浏览器池模式
+        self.browser_pool = browser_pool
+        self.use_pool = browser_pool is not None
+        self._context_wrapper = None  # 浏览器池模式下的Context包装器
 
         # Playwright相关
         self.playwright = None
@@ -4549,20 +4651,84 @@ class PageDrivenTaskExecutor:
             return False
 
     def start_browser(self):
-        """启动浏览器并登录"""
+        """启动浏览器并登录
+
+        浏览器池模式：从池中获取Context，不创建新浏览器
+        传统模式：创建新的浏览器实例
+        """
         if not PLAYWRIGHT_AVAILABLE:
             raise Exception("Playwright未安装，无法启动浏览器")
 
+        # ========== 浏览器池模式 ==========
+        if self.use_pool and self.browser_pool:
+            print("\n🌐 使用浏览器池模式")
+
+            # 检查池中是否已有该账号的Context
+            if self.browser_pool.has_context(self.account_name):
+                print(f"   ✓ 发现账号 {self.account_name} 的现有Context")
+                self._context_wrapper = self.browser_pool._contexts[self.account_name]
+                self.context = self._context_wrapper.context
+                self.page = self._context_wrapper.page
+
+                # 检查登录状态
+                is_logged_in, status = self._check_login_status()
+                if is_logged_in:
+                    self._context_wrapper.update_last_used()
+                    print(f"   ✓ 浏览器已就绪（使用池中Context）")
+                    return
+                else:
+                    print(f"   ⚠️ 池中Context登录已失效，需要刷新Cookie")
+                    # 移除失效的Context
+                    self.browser_pool.remove_context(self.account_name)
+
+            # 从池中创建新Context
+            print(f"   正在为账号 {self.account_name} 创建新Context...")
+            self._context_wrapper = self.browser_pool.get_context(self.account_name, self.cookies)
+            self.context = self._context_wrapper.context
+            self.page = self._context_wrapper.page
+
+            # 跳转到首页验证登录
+            try:
+                self.page.goto("https://e.dianping.com/app/merchant-platform/", timeout=30000)
+                time.sleep(2)
+            except Exception as e:
+                print(f"   ⚠️ 首页加载失败: {e}")
+
+            # 检查登录状态
+            is_logged_in, status = self._check_login_status()
+            if not is_logged_in:
+                if status == "not_logged_in":
+                    report_auth_invalid(self.account_name)
+                    self.browser_pool.remove_context(self.account_name)
+                    raise AuthInvalidError("Cookie登录失败，账户登录状态已失效")
+                elif status == "timeout":
+                    raise Exception("登录检测超时，请检查网络连接后重试")
+                else:
+                    raise Exception(f"登录检测失败: {status}")
+
+            self._context_wrapper.update_last_used()
+            print(f"   ✓ 浏览器已就绪（浏览器池模式，已跳转首页）")
+            return
+
+        # ========== 传统模式 ==========
         print("\n🌐 启动浏览器")
         self.playwright = sync_playwright().start()
 
         max_retries = 2
         for attempt in range(max_retries):
             try:
-                self.browser = self.playwright.chromium.launch(
-                    headless=self.headless,
-                    proxy=None
-                )
+                # 使用WebKit（如果浏览器池模式启用）或Chromium
+                if USE_BROWSER_POOL and BROWSER_POOL_AVAILABLE:
+                    self.browser = self.playwright.webkit.launch(
+                        headless=self.headless,
+                        proxy=None
+                    )
+                    print("   使用 WebKit 引擎")
+                else:
+                    self.browser = self.playwright.chromium.launch(
+                        headless=self.headless,
+                        proxy=None
+                    )
                 break
             except Exception as e:
                 if "Executable doesn't exist" in str(e) and attempt == 0:
@@ -4629,7 +4795,27 @@ class PageDrivenTaskExecutor:
             print(f"✓ 浏览器已启动（Cookie登录）")
 
     def stop_browser(self):
-        """关闭浏览器"""
+        """关闭浏览器
+
+        浏览器池模式：不关闭Context，保留在池中供保活使用
+        传统模式：关闭浏览器
+        """
+        # 浏览器池模式：不关闭，保留Context供后续使用
+        if self.use_pool and self._context_wrapper:
+            print("✓ 任务完成（浏览器池模式，Context保留在池中）")
+
+            # 上传最新Cookie到队列
+            if BROWSER_POOL_AVAILABLE and not self.login_invalid:
+                try:
+                    cookies = self._context_wrapper.get_cookies()
+                    if cookies:
+                        cookie_upload_queue.put(self.account_name, cookies)
+                        print("   ✓ Cookie已加入上传队列")
+                except Exception as e:
+                    print(f"   ⚠️ Cookie上传失败: {e}")
+            return
+
+        # 传统模式：关闭浏览器
         if self.context:
             self.context.close()
         if self.browser:
@@ -4945,7 +5131,7 @@ class PageDrivenTaskExecutor:
         return all_results
 
 
-def run_page_driven_tasks(account_name: str, start_date: str, end_date: str, headless: bool = True) -> List[Dict[str, Any]]:
+def run_page_driven_tasks(account_name: str, start_date: str, end_date: str, headless: bool = True, browser_pool: 'BrowserPoolManager' = None) -> List[Dict[str, Any]]:
     """执行页面驱动的任务
 
     这是页面驱动模式的入口函数，会按照以下顺序执行:
@@ -4958,6 +5144,7 @@ def run_page_driven_tasks(account_name: str, start_date: str, end_date: str, hea
         start_date: 开始日期
         end_date: 结束日期
         headless: 是否使用无头模式
+        browser_pool: 浏览器池管理器（可选，如果提供则使用浏览器池模式）
 
     Returns:
         所有任务的执行结果列表
@@ -4966,7 +5153,7 @@ def run_page_driven_tasks(account_name: str, start_date: str, end_date: str, hea
         print("❌ Playwright未安装，无法使用页面驱动模式")
         return []
 
-    executor = PageDrivenTaskExecutor(account_name, headless=headless)
+    executor = PageDrivenTaskExecutor(account_name, headless=headless, browser_pool=browser_pool)
     return executor.run_all_tasks(start_date, end_date)
 
 
@@ -5041,10 +5228,13 @@ def create_task_schedule() -> bool:
         return False
 
 
-def fetch_task() -> Optional[Dict[str, Any]]:
+def fetch_task(server_ip: str = None) -> Optional[Dict[str, Any]]:
     """获取一条待执行任务
 
     调用 get_task API 获取任务信息
+
+    Args:
+        server_ip: 服务器IP地址（用于任务分配）
 
     Returns:
         dict: 任务信息，包含 id, account_id, task_type, data_start_date, data_end_date 等
@@ -5058,10 +5248,16 @@ def fetch_task() -> Optional[Dict[str, Any]]:
     print(f"{'=' * 80}")
     print(f"   URL: {GET_TASK_API_URL}")
 
+    # 构建请求参数
+    json_param = {}
+    if server_ip:
+        json_param["server"] = server_ip
+        print(f"   Server IP: {server_ip}")
+
     try:
         response = requests.post(
             GET_TASK_API_URL,
-            json={},
+            json=json_param,
             proxies=proxies,
             timeout=30
         )
@@ -5206,11 +5402,12 @@ def print_summary(results: List[Dict[str, Any]]):
     print("=" * 80)
 
 
-def execute_single_task(task_info: Dict[str, Any]) -> bool:
+def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolManager' = None) -> bool:
     """执行单个任务
 
     Args:
         task_info: 从API获取的任务信息
+        browser_pool: 浏览器池管理器（可选，如果提供则使用浏览器池模式）
 
     Returns:
         bool: 任务是否执行成功
@@ -5307,7 +5504,7 @@ def execute_single_task(task_info: Dict[str, Any]) -> bool:
         mtgsig = platform_account.get('mtgsig')
 
         # 使用浏览器跳转页面后获取/创建模板ID
-        templates_id = ensure_template_id_with_browser(account_name, cookies, mtgsig, headless=HEADLESS)
+        templates_id = ensure_template_id_with_browser(account_name, cookies, mtgsig, headless=HEADLESS, browser_pool=browser_pool)
 
         if templates_id:
             print(f"✅ 已成功获取 templates_id: {templates_id}")
@@ -5347,7 +5544,8 @@ def execute_single_task(task_info: Dict[str, Any]) -> bool:
                 account_name=account_name,
                 start_date=start_date,
                 end_date=end_date,
-                headless=HEADLESS
+                headless=HEADLESS,
+                browser_pool=browser_pool
             )
         else:
             result = TASK_MAP[task](account_name, start_date, end_date)
@@ -5393,6 +5591,12 @@ def main():
     3. 获取任务并执行
     4. 无任务时等待5分钟后重试
     5. 支持 Ctrl+C 优雅退出
+
+    浏览器池模式 (USE_BROWSER_POOL=True):
+    - 启动时初始化浏览器池
+    - 启动保活服务（24小时保持Cookie活跃）
+    - 使用服务器IP获取任务
+    - 退出时保存状态
     """
     global _daemon_running
 
@@ -5401,6 +5605,7 @@ def main():
     print("美团点评数据采集系统 (守护进程模式)")
     print("=" * 80)
     print(f"   运行模式: {'开发模式 (24小时运行)' if DEV_MODE else f'生产模式 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)'}")
+    print(f"   浏览器池: {'启用' if USE_BROWSER_POOL and BROWSER_POOL_AVAILABLE else '禁用'}")
     print(f"   无任务等待: {NO_TASK_WAIT_SECONDS // 60} 分钟")
     print(f"   数据目录: {DATA_DIR}")
     print(f"   状态目录: {STATE_DIR}")
@@ -5413,6 +5618,37 @@ def main():
     # 确保目录存在
     ensure_directories()
 
+    # 浏览器池和保活服务
+    browser_pool_instance = None
+    keepalive_service = None
+    server_ip = None
+
+    # ========== 浏览器池模式初始化 ==========
+    if USE_BROWSER_POOL and BROWSER_POOL_AVAILABLE:
+        try:
+            print("\n🚀 初始化浏览器池模式...")
+
+            # 获取服务器公网IP
+            server_ip = get_public_ip()
+            if not server_ip:
+                print("⚠️ 无法获取服务器IP，将使用传统模式")
+            else:
+                print(f"   服务器IP: {server_ip}")
+
+                # 初始化浏览器池
+                browser_pool_instance = initialize_browser_pool(headless=HEADLESS)
+
+                # 启动保活服务
+                keepalive_service = start_keepalive_service(browser_pool_instance)
+
+                print("✅ 浏览器池模式初始化完成")
+
+        except Exception as e:
+            print(f"❌ 浏览器池初始化失败: {e}")
+            print("   将使用传统模式运行")
+            browser_pool_instance = None
+            keepalive_service = None
+
     # 统计信息
     total_tasks = 0
     success_tasks = 0
@@ -5422,67 +5658,123 @@ def main():
     print("   按 Ctrl+C 可优雅退出\n")
 
     # ========== 主循环 ==========
-    while _daemon_running:
-        try:
-            # ========== Step 1: 时间窗口检查 ==========
-            if not is_in_work_window():
-                wait_seconds = seconds_until_work_start()
-                hours = wait_seconds // 3600
-                minutes = (wait_seconds % 3600) // 60
-                print(f"\n{'=' * 60}")
-                print(f"💤 当前非工作时间 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)")
-                print(f"   将在 {hours}小时{minutes}分钟 后开始工作...")
-                print(f"{'=' * 60}")
+    try:
+        while _daemon_running:
+            try:
+                # ========== Step 1: 时间窗口检查 ==========
+                if not is_in_work_window():
+                    wait_seconds = seconds_until_work_start()
+                    hours = wait_seconds // 3600
+                    minutes = (wait_seconds % 3600) // 60
+                    print(f"\n{'=' * 60}")
+                    print(f"💤 当前非工作时间 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)")
+                    print(f"   将在 {hours}小时{minutes}分钟 后开始工作...")
+                    print(f"{'=' * 60}")
 
-                if not interruptible_sleep(wait_seconds):
-                    break  # 收到退出信号
-                continue
+                    if not interruptible_sleep(wait_seconds):
+                        break  # 收到退出信号
+                    continue
 
-            # ========== Step 2: 生成任务调度 ==========
-            create_task_schedule()
-            time.sleep(5)
+                # ========== Step 2: 生成任务调度 ==========
+                create_task_schedule()
+                time.sleep(5)
 
-            # ========== Step 3: 获取任务 ==========
-            task_info = fetch_task()
+                # ========== Step 3: 获取任务 ==========
+                # 浏览器池模式下传入服务器IP
+                if browser_pool_instance and server_ip:
+                    task_info = fetch_task(server_ip=server_ip)
+                else:
+                    task_info = fetch_task()
 
-            if not task_info:
-                print(f"\n⏳ 暂无待执行任务，{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
+                if not task_info:
+                    print(f"\n⏳ 暂无待执行任务，{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
+                    reschedule_failed_tasks()
+
+                    # 在等待期间执行保活（同步模式，解决 Playwright greenlet 线程限制）
+                    if keepalive_service and browser_pool_instance:
+                        # 分段等待，每60秒检查一次是否需要保活
+                        remaining_wait = NO_TASK_WAIT_SECONDS
+                        keepalive_check_interval = 60  # 每60秒检查一次
+
+                        while remaining_wait > 0 and _daemon_running:
+                            # 等待一小段时间
+                            sleep_chunk = min(keepalive_check_interval, remaining_wait)
+                            if not interruptible_sleep(sleep_chunk):
+                                break  # 收到退出信号
+                            remaining_wait -= sleep_chunk
+
+                            # 执行一批保活（如果有需要的账号）
+                            if _daemon_running and remaining_wait > 0:
+                                try:
+                                    keepalive_service.perform_keepalive_batch()
+                                except Exception as e:
+                                    print(f"   ⚠️ 保活执行异常: {e}")
+
+                        if not _daemon_running:
+                            break  # 收到退出信号
+                    else:
+                        # 非浏览器池模式，直接等待
+                        if not interruptible_sleep(NO_TASK_WAIT_SECONDS):
+                            break  # 收到退出信号
+
+                    continue
+
+                # ========== Step 4: 执行任务 ==========
+                total_tasks += 1
+
+                # 浏览器池模式下使用账号锁
+                if browser_pool_instance:
+                    account_id = task_info.get('account_id')
+                    # 获取账号锁（阻塞等待，最多等60秒）
+                    if account_lock_manager.acquire(account_id, blocking=True, timeout=60):
+                        try:
+                            success = execute_single_task(task_info, browser_pool=browser_pool_instance)
+                        finally:
+                            account_lock_manager.release(account_id)
+                    else:
+                        print(f"⚠️ 账号 {account_id} 锁获取超时，跳过此任务")
+                        success = False
+                else:
+                    success = execute_single_task(task_info)
+
+                if success:
+                    success_tasks += 1
+                else:
+                    failed_tasks += 1
+
+                # ========== Step 5: 重新调度失败任务 ==========
                 reschedule_failed_tasks()
 
-                if not interruptible_sleep(NO_TASK_WAIT_SECONDS):
-                    break  # 收到退出信号
-                continue
+                # 打印当前统计
+                print(f"\n📊 累计统计: 总任务={total_tasks}, 成功={success_tasks}, 失败={failed_tasks}")
 
-            # ========== Step 4: 执行任务 ==========
-            total_tasks += 1
-            success = execute_single_task(task_info)
+                # 短暂等待后继续下一轮
+                time.sleep(2)
 
-            if success:
-                success_tasks += 1
-            else:
-                failed_tasks += 1
-
-            # ========== Step 5: 重新调度失败任务 ==========
-            reschedule_failed_tasks()
-
-            # 打印当前统计
-            print(f"\n📊 累计统计: 总任务={total_tasks}, 成功={success_tasks}, 失败={failed_tasks}")
-
-            # 短暂等待后继续下一轮
-            time.sleep(2)
-
-        except KeyboardInterrupt:
-            # 二次 Ctrl+C 强制退出
-            print("\n⚠️ 再次收到中断信号，强制退出...")
-            break
-        except Exception as e:
-            print(f"\n❌ 主循环发生异常: {e}")
-            import traceback
-            traceback.print_exc()
-            # 等待一段时间后继续
-            print(f"   将在60秒后继续运行...")
-            if not interruptible_sleep(60):
+            except KeyboardInterrupt:
+                # 二次 Ctrl+C 强制退出
+                print("\n⚠️ 再次收到中断信号，强制退出...")
                 break
+            except Exception as e:
+                print(f"\n❌ 主循环发生异常: {e}")
+                import traceback
+                traceback.print_exc()
+                # 等待一段时间后继续
+                print(f"   将在60秒后继续运行...")
+                if not interruptible_sleep(60):
+                    break
+
+    finally:
+        # ========== 清理浏览器池 ==========
+        if browser_pool_instance:
+            print("\n🛑 正在关闭浏览器池...")
+            try:
+                if keepalive_service:
+                    keepalive_service.stop()
+                shutdown_browser_pool()
+                print("✅ 浏览器池已关闭")
+            except Exception as e:
+                print(f"⚠️ 关闭浏览器池时出错: {e}")
 
     # ========== 退出 ==========
     print("\n" + "=" * 80)
