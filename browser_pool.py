@@ -824,98 +824,134 @@ def get_browser_pool() -> BrowserPoolManager:
 
 
 # ============================================================================
-# 保活服务
+# 保活服务（同步模式 - 解决 Playwright greenlet 线程限制）
 # ============================================================================
 
 class KeepaliveService:
-    """保活服务
+    """保活服务（同步模式）
 
-    后台线程定期对所有账号执行保活操作
-    采用错峰策略，避免资源峰值
+    注意：Playwright sync API 使用 greenlet 实现，对象只能在创建它的线程中使用。
+    因此保活操作必须在主线程中执行，不能使用后台线程。
+
+    使用方式：在主循环的空闲时间调用 perform_keepalive_batch()
     """
 
     def __init__(self, pool: BrowserPoolManager):
         self.pool = pool
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
+        self._last_full_cycle_time: Optional[datetime] = None  # 上次完整保活周期时间
 
     def start(self):
-        """启动保活服务"""
-        if self._running:
-            return
-
-        self._running = True
-        self._thread = threading.Thread(target=self._keepalive_worker, daemon=True)
-        self._thread.start()
-        print("✅ 保活服务已启动")
+        """启动保活服务（同步模式下仅打印提示）"""
+        print("✅ 保活服务已启动（同步模式，将在主循环空闲时执行）")
 
     def stop(self):
-        """停止保活服务"""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=10)
+        """停止保活服务（同步模式下仅打印提示）"""
         print("✅ 保活服务已停止")
 
-    def _keepalive_worker(self):
-        """保活工作线程"""
-        while self._running:
-            try:
-                # 检查浏览器是否需要重启
-                self.pool.check_and_restart()
+    def get_accounts_needing_keepalive(self) -> List[str]:
+        """获取需要保活的账号列表
 
-                # 获取所有账号
-                account_ids = self.pool.get_all_account_ids()
+        返回 last_keepalive_at 超过 KEEPALIVE_INTERVAL 的账号，
+        按最后保活时间排序（最久未保活的优先）
 
-                if not account_ids:
-                    time.sleep(60)  # 没有账号，等待1分钟
-                    continue
+        Returns:
+            List[str]: 需要保活的账号ID列表
+        """
+        accounts_to_keepalive = []
+        now = datetime.now()
 
-                print(f"\n🔄 开始保活轮询，共 {len(account_ids)} 个账号")
+        with self.pool._lock:
+            for account_id, wrapper in self.pool._contexts.items():
+                # 检查是否需要保活
+                if wrapper.last_keepalive_at is None:
+                    # 从未保活过，需要保活
+                    accounts_to_keepalive.append((account_id, datetime.min))
+                else:
+                    time_since_keepalive = (now - wrapper.last_keepalive_at).total_seconds()
+                    if time_since_keepalive >= KEEPALIVE_INTERVAL:
+                        accounts_to_keepalive.append((account_id, wrapper.last_keepalive_at))
 
-                # 错峰保活
-                for i in range(0, len(account_ids), KEEPALIVE_BATCH_SIZE):
-                    if not self._running:
-                        break
+        # 按最后保活时间排序（最久未保活的优先）
+        accounts_to_keepalive.sort(key=lambda x: x[1])
 
-                    batch = account_ids[i:i + KEEPALIVE_BATCH_SIZE]
+        return [account_id for account_id, _ in accounts_to_keepalive]
 
-                    for account_id in batch:
-                        if not self._running:
-                            break
+    def perform_keepalive_batch(self) -> int:
+        """执行一批保活操作（同步，必须在主线程调用）
 
-                        self._keepalive_single(account_id)
+        每次调用处理最多 KEEPALIVE_BATCH_SIZE 个账号
 
-                    # 批次间等待
-                    if i + KEEPALIVE_BATCH_SIZE < len(account_ids):
-                        print(f"   ⏳ 等待 {KEEPALIVE_BATCH_INTERVAL} 秒后继续下一批...")
-                        time.sleep(KEEPALIVE_BATCH_INTERVAL)
+        Returns:
+            int: 成功保活的账号数
+        """
+        # 检查浏览器是否需要重启
+        self.pool.check_and_restart()
 
-                print(f"✅ 保活轮询完成，等待 {KEEPALIVE_INTERVAL // 60} 分钟后开始下一轮")
+        # 获取需要保活的账号
+        accounts = self.get_accounts_needing_keepalive()
 
-                # 等待下一轮
-                for _ in range(KEEPALIVE_INTERVAL):
-                    if not self._running:
-                        break
-                    time.sleep(1)
+        if not accounts:
+            return 0
 
-            except Exception as e:
-                print(f"❌ 保活工作线程异常: {e}")
-                time.sleep(60)
+        # 取一批
+        batch = accounts[:KEEPALIVE_BATCH_SIZE]
+        print(f"\n🔄 执行保活批次，本批 {len(batch)} 个账号（共 {len(accounts)} 个待保活）")
 
-    def _keepalive_single(self, account_id: str):
-        """对单个账号执行保活"""
+        success_count = 0
+        for account_id in batch:
+            if self._keepalive_single(account_id):
+                success_count += 1
+
+        print(f"   ✅ 本批保活完成: {success_count}/{len(batch)} 成功")
+
+        return success_count
+
+    def perform_full_keepalive_cycle(self) -> Tuple[int, int]:
+        """执行完整的保活周期（所有账号）
+
+        Returns:
+            Tuple[int, int]: (成功数, 总数)
+        """
+        account_ids = self.pool.get_all_account_ids()
+
+        if not account_ids:
+            return 0, 0
+
+        print(f"\n🔄 开始完整保活周期，共 {len(account_ids)} 个账号")
+
+        success_count = 0
+        for i, account_id in enumerate(account_ids):
+            if self._keepalive_single(account_id):
+                success_count += 1
+
+            # 每批之间短暂等待（避免资源峰值）
+            if (i + 1) % KEEPALIVE_BATCH_SIZE == 0 and i + 1 < len(account_ids):
+                print(f"   ⏳ 已处理 {i + 1}/{len(account_ids)}，短暂等待...")
+                time.sleep(5)
+
+        self._last_full_cycle_time = datetime.now()
+        print(f"✅ 完整保活周期完成: {success_count}/{len(account_ids)} 成功")
+
+        return success_count, len(account_ids)
+
+    def _keepalive_single(self, account_id: str) -> bool:
+        """对单个账号执行保活
+
+        Returns:
+            bool: 是否成功
+        """
         # 尝试获取锁（非阻塞）
         if not account_lock_manager.try_lock(account_id):
             print(f"   ⏭️ {account_id} 正在执行任务，跳过保活")
-            return
+            return False
 
         try:
             if not self.pool.has_context(account_id):
-                return
+                return False
 
             wrapper = self.pool._contexts.get(account_id)
             if not wrapper or not wrapper.page:
-                return
+                return False
 
             print(f"   🔄 保活 {account_id}...")
 
@@ -929,7 +965,7 @@ class KeepaliveService:
                 if 'login' in current_url.lower():
                     print(f"   ⚠️ {account_id} Cookie已失效，上报失效状态")
                     self._report_cookie_invalid(account_id)
-                    return
+                    return False
 
                 # 获取并上传Cookie
                 cookies = wrapper.get_cookies()
@@ -937,9 +973,11 @@ class KeepaliveService:
 
                 wrapper.update_last_keepalive()
                 print(f"   ✅ {account_id} 保活成功")
+                return True
 
             except Exception as e:
                 print(f"   ⚠️ {account_id} 保活失败: {e}")
+                return False
 
         finally:
             account_lock_manager.release(account_id)
