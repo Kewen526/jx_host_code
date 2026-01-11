@@ -5622,8 +5622,33 @@ def main():
                     print(f"\n⏳ 暂无待执行任务，{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
                     reschedule_failed_tasks()
 
-                    if not interruptible_sleep(NO_TASK_WAIT_SECONDS):
-                        break  # 收到退出信号
+                    # 在等待期间执行保活（同步模式，解决 Playwright greenlet 线程限制）
+                    if keepalive_service and browser_pool_instance:
+                        # 分段等待，每60秒检查一次是否需要保活
+                        remaining_wait = NO_TASK_WAIT_SECONDS
+                        keepalive_check_interval = 60  # 每60秒检查一次
+
+                        while remaining_wait > 0 and _daemon_running:
+                            # 等待一小段时间
+                            sleep_chunk = min(keepalive_check_interval, remaining_wait)
+                            if not interruptible_sleep(sleep_chunk):
+                                break  # 收到退出信号
+                            remaining_wait -= sleep_chunk
+
+                            # 执行一批保活（如果有需要的账号）
+                            if _daemon_running and remaining_wait > 0:
+                                try:
+                                    keepalive_service.perform_keepalive_batch()
+                                except Exception as e:
+                                    print(f"   ⚠️ 保活执行异常: {e}")
+
+                        if not _daemon_running:
+                            break  # 收到退出信号
+                    else:
+                        # 非浏览器池模式，直接等待
+                        if not interruptible_sleep(NO_TASK_WAIT_SECONDS):
+                            break  # 收到退出信号
+
                     continue
 
                 # ========== Step 4: 执行任务 ==========
