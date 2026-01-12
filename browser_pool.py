@@ -43,11 +43,22 @@ MAX_BROWSERS = 10                    # 最大Browser数量
 MAX_CONTEXTS_PER_BROWSER = 15        # 每个Browser最大Context数量
 BROWSER_TYPE = "chromium"            # 浏览器类型: webkit / chromium / firefox
 
-# 保活配置
-KEEPALIVE_INTERVAL = 30 * 60         # 保活间隔（秒）：30分钟
+# 保活配置（优化后）
+KEEPALIVE_INTERVAL = 60 * 60         # 保活间隔（秒）：60分钟（原30分钟）
 KEEPALIVE_PAGE_URL = "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html"
-KEEPALIVE_BATCH_SIZE = 5             # 每批保活账号数量（错峰）
+KEEPALIVE_BATCH_SIZE = 2             # 每批保活账号数量（原5个）
 KEEPALIVE_BATCH_INTERVAL = 60        # 每批之间的间隔（秒）
+KEEPALIVE_TIMEOUT = 15000            # 保活页面超时（毫秒）：15秒（原30秒）
+KEEPALIVE_FAIL_COOLDOWN = 10 * 60    # 失败冷却时间（秒）：10分钟
+
+# 资源保护配置
+RESOURCE_CHECK_INTERVAL = 30         # 资源检查间隔（秒）
+CPU_WARNING_THRESHOLD = 50           # CPU警告阈值（%）
+CPU_CRITICAL_THRESHOLD = 70          # CPU危险阈值（%）
+MEMORY_WARNING_THRESHOLD = 60        # 内存警告阈值（%）
+MEMORY_CRITICAL_THRESHOLD = 80       # 内存危险阈值（%）
+MAX_ACTIVE_CONTEXTS = 10             # 最大活跃Context数量
+CONTEXT_IDLE_TIMEOUT = 30 * 60       # Context空闲超时（秒）：30分钟
 
 # 浏览器重启配置
 BROWSER_RESTART_HOUR = 14            # 每天重启时间（14点，任务少的时候）
@@ -86,6 +97,156 @@ _server_ip: Optional[str] = None
 
 # 浏览器池运行状态
 _pool_running = True
+
+
+# ============================================================================
+# 资源监控模块
+# ============================================================================
+
+class ResourceMonitor:
+    """资源监控器 - 防止服务器过载"""
+
+    # 资源状态常量
+    STATUS_NORMAL = "normal"      # 正常：可以执行所有操作
+    STATUS_WARNING = "warning"    # 警告：暂停保活，只执行任务
+    STATUS_CRITICAL = "critical"  # 危险：暂停所有操作，释放资源
+
+    def __init__(self):
+        self._last_check_time: Optional[datetime] = None
+        self._cached_status: str = self.STATUS_NORMAL
+        self._cached_cpu: float = 0.0
+        self._cached_memory: float = 0.0
+
+    def get_cpu_usage(self) -> float:
+        """获取CPU使用率（%）"""
+        try:
+            # 读取 /proc/stat 计算CPU使用率
+            with open('/proc/stat', 'r') as f:
+                line = f.readline()
+            values = line.split()[1:8]
+            values = [int(v) for v in values]
+
+            # user, nice, system, idle, iowait, irq, softirq
+            idle = values[3] + values[4]
+            total = sum(values)
+
+            # 需要两次采样计算差值
+            if not hasattr(self, '_last_cpu_idle'):
+                self._last_cpu_idle = idle
+                self._last_cpu_total = total
+                time.sleep(0.1)
+                return self.get_cpu_usage()
+
+            idle_delta = idle - self._last_cpu_idle
+            total_delta = total - self._last_cpu_total
+
+            self._last_cpu_idle = idle
+            self._last_cpu_total = total
+
+            if total_delta == 0:
+                return 0.0
+
+            usage = 100.0 * (1.0 - idle_delta / total_delta)
+            return round(usage, 1)
+
+        except Exception as e:
+            print(f"⚠️ 获取CPU使用率失败: {e}")
+            return 0.0
+
+    def get_memory_usage(self) -> float:
+        """获取内存使用率（%）"""
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                lines = f.readlines()
+
+            mem_info = {}
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 2:
+                    key = parts[0].rstrip(':')
+                    value = int(parts[1])
+                    mem_info[key] = value
+
+            total = mem_info.get('MemTotal', 1)
+            available = mem_info.get('MemAvailable', mem_info.get('MemFree', 0))
+
+            usage = 100.0 * (1.0 - available / total)
+            return round(usage, 1)
+
+        except Exception as e:
+            print(f"⚠️ 获取内存使用率失败: {e}")
+            return 0.0
+
+    def check_status(self, force: bool = False) -> str:
+        """检查资源状态
+
+        Args:
+            force: 是否强制刷新（忽略缓存）
+
+        Returns:
+            str: STATUS_NORMAL / STATUS_WARNING / STATUS_CRITICAL
+        """
+        now = datetime.now()
+
+        # 使用缓存（避免频繁检查）
+        if not force and self._last_check_time:
+            elapsed = (now - self._last_check_time).total_seconds()
+            if elapsed < RESOURCE_CHECK_INTERVAL:
+                return self._cached_status
+
+        # 获取资源使用率
+        cpu = self.get_cpu_usage()
+        memory = self.get_memory_usage()
+
+        self._cached_cpu = cpu
+        self._cached_memory = memory
+        self._last_check_time = now
+
+        # 判断状态
+        if cpu >= CPU_CRITICAL_THRESHOLD or memory >= MEMORY_CRITICAL_THRESHOLD:
+            self._cached_status = self.STATUS_CRITICAL
+        elif cpu >= CPU_WARNING_THRESHOLD or memory >= MEMORY_WARNING_THRESHOLD:
+            self._cached_status = self.STATUS_WARNING
+        else:
+            self._cached_status = self.STATUS_NORMAL
+
+        return self._cached_status
+
+    def is_safe_for_keepalive(self) -> bool:
+        """是否可以安全执行保活"""
+        status = self.check_status()
+        return status == self.STATUS_NORMAL
+
+    def is_safe_for_task(self) -> bool:
+        """是否可以安全执行任务"""
+        status = self.check_status()
+        return status != self.STATUS_CRITICAL
+
+    def get_status_info(self) -> Dict[str, Any]:
+        """获取资源状态详情"""
+        status = self.check_status()
+        return {
+            'status': status,
+            'cpu': self._cached_cpu,
+            'memory': self._cached_memory,
+            'safe_for_keepalive': status == self.STATUS_NORMAL,
+            'safe_for_task': status != self.STATUS_CRITICAL
+        }
+
+    def print_status(self):
+        """打印资源状态"""
+        info = self.get_status_info()
+        status_emoji = {
+            self.STATUS_NORMAL: "✅",
+            self.STATUS_WARNING: "⚠️",
+            self.STATUS_CRITICAL: "🚨"
+        }
+        emoji = status_emoji.get(info['status'], "❓")
+        print(f"   {emoji} 资源状态: CPU={info['cpu']}%, 内存={info['memory']}%, 状态={info['status']}")
+
+
+# 全局资源监控器
+resource_monitor = ResourceMonitor()
 
 
 # ============================================================================
@@ -810,6 +971,135 @@ class BrowserPoolManager:
 
         return True
 
+    def release_idle_contexts(self) -> int:
+        """释放空闲的Context（资源紧张时调用）
+
+        释放超过 CONTEXT_IDLE_TIMEOUT 未使用的 Context
+
+        Returns:
+            int: 释放的Context数量
+        """
+        now = datetime.now()
+        released = 0
+
+        with self._lock:
+            # 找出空闲的Context
+            idle_accounts = []
+            for account_id, wrapper in self._contexts.items():
+                idle_time = (now - wrapper.last_used_at).total_seconds()
+                if idle_time >= CONTEXT_IDLE_TIMEOUT:
+                    idle_accounts.append((account_id, idle_time))
+
+            # 按空闲时间排序（最久未使用的优先释放）
+            idle_accounts.sort(key=lambda x: x[1], reverse=True)
+
+            # 释放空闲Context
+            for account_id, idle_time in idle_accounts:
+                try:
+                    wrapper = self._contexts.pop(account_id)
+                    browser_index = wrapper.browser_index
+
+                    # 先保存Cookie
+                    cookies = wrapper.get_cookies()
+
+                    wrapper.close()
+                    self._browser_context_counts[browser_index] -= 1
+
+                    print(f"   🗑️ 释放空闲Context: {account_id}（空闲 {int(idle_time/60)} 分钟）")
+                    released += 1
+
+                except Exception as e:
+                    print(f"   ⚠️ 释放 {account_id} Context失败: {e}")
+
+        if released > 0:
+            print(f"   ✅ 共释放 {released} 个空闲Context")
+
+        return released
+
+    def enforce_context_limit(self) -> int:
+        """强制执行Context数量限制
+
+        当 Context 数量超过 MAX_ACTIVE_CONTEXTS 时，
+        释放最久未使用的 Context
+
+        Returns:
+            int: 释放的Context数量
+        """
+        with self._lock:
+            current_count = len(self._contexts)
+
+            if current_count <= MAX_ACTIVE_CONTEXTS:
+                return 0
+
+            # 需要释放的数量
+            to_release = current_count - MAX_ACTIVE_CONTEXTS
+
+            # 按最后使用时间排序
+            sorted_accounts = sorted(
+                self._contexts.items(),
+                key=lambda x: x[1].last_used_at
+            )
+
+            released = 0
+            for account_id, wrapper in sorted_accounts[:to_release]:
+                try:
+                    browser_index = wrapper.browser_index
+                    wrapper.close()
+                    del self._contexts[account_id]
+                    self._browser_context_counts[browser_index] -= 1
+
+                    print(f"   🗑️ 超限释放Context: {account_id}")
+                    released += 1
+
+                except Exception as e:
+                    print(f"   ⚠️ 释放 {account_id} Context失败: {e}")
+
+            if released > 0:
+                print(f"   ✅ 超限释放 {released} 个Context（当前 {len(self._contexts)} 个）")
+
+            return released
+
+    def emergency_release(self) -> int:
+        """紧急释放资源（资源危险时调用）
+
+        释放一半的Context来降低资源占用
+
+        Returns:
+            int: 释放的Context数量
+        """
+        print("\n🚨 紧急资源释放...")
+
+        with self._lock:
+            current_count = len(self._contexts)
+            if current_count == 0:
+                return 0
+
+            # 释放一半
+            to_release = max(1, current_count // 2)
+
+            # 按最后使用时间排序（最久未使用的优先）
+            sorted_accounts = sorted(
+                self._contexts.items(),
+                key=lambda x: x[1].last_used_at
+            )
+
+            released = 0
+            for account_id, wrapper in sorted_accounts[:to_release]:
+                try:
+                    browser_index = wrapper.browser_index
+                    wrapper.close()
+                    del self._contexts[account_id]
+                    self._browser_context_counts[browser_index] -= 1
+
+                    print(f"   🗑️ 紧急释放: {account_id}")
+                    released += 1
+
+                except Exception as e:
+                    print(f"   ⚠️ 释放 {account_id} 失败: {e}")
+
+            print(f"   ✅ 紧急释放完成: {released}/{to_release}（剩余 {len(self._contexts)} 个）")
+            return released
+
 
 # 全局浏览器池管理器
 browser_pool: Optional[BrowserPoolManager] = None
@@ -828,31 +1118,55 @@ def get_browser_pool() -> BrowserPoolManager:
 # ============================================================================
 
 class KeepaliveService:
-    """保活服务（同步模式）
+    """保活服务（同步模式 + 资源保护）
 
     注意：Playwright sync API 使用 greenlet 实现，对象只能在创建它的线程中使用。
     因此保活操作必须在主线程中执行，不能使用后台线程。
+
+    资源保护机制：
+    - 执行前检查CPU/内存使用率
+    - 资源紧张时自动跳过保活
+    - 失败账号有冷却时间，避免重复重试
 
     使用方式：在主循环的空闲时间调用 perform_keepalive_batch()
     """
 
     def __init__(self, pool: BrowserPoolManager):
         self.pool = pool
-        self._last_full_cycle_time: Optional[datetime] = None  # 上次完整保活周期时间
+        self._last_full_cycle_time: Optional[datetime] = None
+        self._fail_cooldown: Dict[str, datetime] = {}  # 失败账号冷却记录
 
     def start(self):
         """启动保活服务（同步模式下仅打印提示）"""
-        print("✅ 保活服务已启动（同步模式，将在主循环空闲时执行）")
+        print("✅ 保活服务已启动（同步模式 + 资源保护）")
+        resource_monitor.print_status()
 
     def stop(self):
         """停止保活服务（同步模式下仅打印提示）"""
         print("✅ 保活服务已停止")
 
+    def _is_in_cooldown(self, account_id: str) -> bool:
+        """检查账号是否在冷却期"""
+        if account_id not in self._fail_cooldown:
+            return False
+
+        cooldown_until = self._fail_cooldown[account_id]
+        if datetime.now() >= cooldown_until:
+            # 冷却期结束，移除记录
+            del self._fail_cooldown[account_id]
+            return False
+
+        return True
+
+    def _set_cooldown(self, account_id: str):
+        """设置账号冷却"""
+        self._fail_cooldown[account_id] = datetime.now() + timedelta(seconds=KEEPALIVE_FAIL_COOLDOWN)
+
     def get_accounts_needing_keepalive(self) -> List[str]:
         """获取需要保活的账号列表
 
         返回 last_keepalive_at 超过 KEEPALIVE_INTERVAL 的账号，
-        按最后保活时间排序（最久未保活的优先）
+        排除在冷却期的账号，按最后保活时间排序（最久未保活的优先）
 
         Returns:
             List[str]: 需要保活的账号ID列表
@@ -862,9 +1176,12 @@ class KeepaliveService:
 
         with self.pool._lock:
             for account_id, wrapper in self.pool._contexts.items():
+                # 检查是否在冷却期
+                if self._is_in_cooldown(account_id):
+                    continue
+
                 # 检查是否需要保活
                 if wrapper.last_keepalive_at is None:
-                    # 从未保活过，需要保活
                     accounts_to_keepalive.append((account_id, datetime.min))
                 else:
                     time_since_keepalive = (now - wrapper.last_keepalive_at).total_seconds()
@@ -879,11 +1196,18 @@ class KeepaliveService:
     def perform_keepalive_batch(self) -> int:
         """执行一批保活操作（同步，必须在主线程调用）
 
-        每次调用处理最多 KEEPALIVE_BATCH_SIZE 个账号
+        会先检查资源状态，资源紧张时自动跳过。
+        每次调用处理最多 KEEPALIVE_BATCH_SIZE 个账号。
 
         Returns:
-            int: 成功保活的账号数
+            int: 成功保活的账号数，-1 表示因资源问题跳过
         """
+        # ===== 资源检查 =====
+        if not resource_monitor.is_safe_for_keepalive():
+            resource_monitor.print_status()
+            print("   ⏸️ 资源紧张，跳过本次保活")
+            return -1
+
         # 检查浏览器是否需要重启
         self.pool.check_and_restart()
 
@@ -895,10 +1219,18 @@ class KeepaliveService:
 
         # 取一批
         batch = accounts[:KEEPALIVE_BATCH_SIZE]
-        print(f"\n🔄 执行保活批次，本批 {len(batch)} 个账号（共 {len(accounts)} 个待保活）")
+        cooldown_count = len(self._fail_cooldown)
+
+        print(f"\n🔄 执行保活批次，本批 {len(batch)} 个（待保活 {len(accounts)}，冷却中 {cooldown_count}）")
+        resource_monitor.print_status()
 
         success_count = 0
         for account_id in batch:
+            # 每个账号执行前再次检查资源
+            if not resource_monitor.is_safe_for_keepalive():
+                print("   ⏸️ 资源紧张，中断本批保活")
+                break
+
             if self._keepalive_single(account_id):
                 success_count += 1
 
@@ -912,6 +1244,12 @@ class KeepaliveService:
         Returns:
             Tuple[int, int]: (成功数, 总数)
         """
+        # 资源检查
+        if not resource_monitor.is_safe_for_keepalive():
+            resource_monitor.print_status()
+            print("   ⏸️ 资源紧张，跳过完整保活周期")
+            return 0, 0
+
         account_ids = self.pool.get_all_account_ids()
 
         if not account_ids:
@@ -921,6 +1259,11 @@ class KeepaliveService:
 
         success_count = 0
         for i, account_id in enumerate(account_ids):
+            # 每个账号执行前检查资源
+            if not resource_monitor.is_safe_for_keepalive():
+                print(f"   ⏸️ 资源紧张，中断保活周期（已处理 {i}/{len(account_ids)}）")
+                break
+
             if self._keepalive_single(account_id):
                 success_count += 1
 
@@ -955,16 +1298,17 @@ class KeepaliveService:
 
             print(f"   🔄 保活 {account_id}...")
 
-            # 访问保活页面
+            # 访问保活页面（使用优化后的超时时间）
             try:
-                wrapper.page.goto(KEEPALIVE_PAGE_URL, timeout=30000)
-                time.sleep(2)  # 等待页面加载
+                wrapper.page.goto(KEEPALIVE_PAGE_URL, timeout=KEEPALIVE_TIMEOUT)
+                time.sleep(1)  # 等待页面加载（缩短为1秒）
 
                 # 检查是否被重定向到登录页
                 current_url = wrapper.page.url
                 if 'login' in current_url.lower():
                     print(f"   ⚠️ {account_id} Cookie已失效，上报失效状态")
                     self._report_cookie_invalid(account_id)
+                    self._set_cooldown(account_id)  # 失效也设置冷却
                     return False
 
                 # 获取并上传Cookie
@@ -977,6 +1321,7 @@ class KeepaliveService:
 
             except Exception as e:
                 print(f"   ⚠️ {account_id} 保活失败: {e}")
+                self._set_cooldown(account_id)  # 失败设置冷却
                 return False
 
         finally:

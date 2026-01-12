@@ -48,6 +48,7 @@ try:
         get_cached_ip,
         BrowserPoolManager,
         KeepaliveService,
+        resource_monitor,  # 资源监控器
     )
     BROWSER_POOL_AVAILABLE = True
 except ImportError as e:
@@ -5690,9 +5691,9 @@ def main():
                     print(f"\n⏳ 暂无待执行任务，{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
                     reschedule_failed_tasks()
 
-                    # 在等待期间执行保活（同步模式，解决 Playwright greenlet 线程限制）
+                    # 在等待期间执行保活（同步模式 + 资源保护）
                     if keepalive_service and browser_pool_instance:
-                        # 分段等待，每60秒检查一次是否需要保活
+                        # 分段等待，每60秒检查一次
                         remaining_wait = NO_TASK_WAIT_SECONDS
                         keepalive_check_interval = 60  # 每60秒检查一次
 
@@ -5703,12 +5704,36 @@ def main():
                                 break  # 收到退出信号
                             remaining_wait -= sleep_chunk
 
-                            # 执行一批保活（如果有需要的账号）
-                            if _daemon_running and remaining_wait > 0:
-                                try:
-                                    keepalive_service.perform_keepalive_batch()
-                                except Exception as e:
-                                    print(f"   ⚠️ 保活执行异常: {e}")
+                            if not _daemon_running or remaining_wait <= 0:
+                                break
+
+                            # ===== 资源检查与自动调节 =====
+                            try:
+                                status = resource_monitor.check_status(force=True)
+
+                                if status == resource_monitor.STATUS_CRITICAL:
+                                    # 危险：紧急释放资源
+                                    print("\n🚨 资源危险！执行紧急释放...")
+                                    resource_monitor.print_status()
+                                    browser_pool_instance.emergency_release()
+                                    # 跳过保活
+                                    continue
+
+                                elif status == resource_monitor.STATUS_WARNING:
+                                    # 警告：释放空闲Context，跳过保活
+                                    resource_monitor.print_status()
+                                    browser_pool_instance.release_idle_contexts()
+                                    # 跳过保活
+                                    continue
+
+                                # 正常：执行保活
+                                keepalive_service.perform_keepalive_batch()
+
+                                # 执行Context数量限制
+                                browser_pool_instance.enforce_context_limit()
+
+                            except Exception as e:
+                                print(f"   ⚠️ 空闲处理异常: {e}")
 
                         if not _daemon_running:
                             break  # 收到退出信号
@@ -5720,6 +5745,19 @@ def main():
                     continue
 
                 # ========== Step 4: 执行任务 ==========
+
+                # 资源检查（任务执行前）
+                if browser_pool_instance and BROWSER_POOL_AVAILABLE:
+                    status = resource_monitor.check_status(force=True)
+                    if status == resource_monitor.STATUS_CRITICAL:
+                        print("\n🚨 资源危险！暂停任务执行，等待资源恢复...")
+                        resource_monitor.print_status()
+                        browser_pool_instance.emergency_release()
+                        # 等待30秒后重试
+                        if not interruptible_sleep(30):
+                            break
+                        continue
+
                 total_tasks += 1
 
                 # 浏览器池模式下使用账号锁
