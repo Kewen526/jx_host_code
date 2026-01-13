@@ -4625,6 +4625,59 @@ class PageDrivenTaskExecutor:
         print("=" * 60)
 
         try:
+            # 3. 重新从API获取Cookie
+            print(f"🔍 正在从API重新获取账户 [{self.account_name}] 的Cookie...")
+            api_data = load_cookies_from_api(self.account_name)
+            self.cookies = api_data['cookies']
+            self.mtgsig = api_data['mtgsig']
+            print(f"✅ 成功加载 {len(self.cookies)} 个新cookies")
+
+            # ========== 浏览器池模式 ==========
+            if self.use_pool and self.browser_pool:
+                print("   使用浏览器池模式重新登录...")
+
+                # 1. 从池中移除旧Context
+                if self.browser_pool.has_context(self.account_name):
+                    self.browser_pool.remove_context(self.account_name)
+                    print(f"   ✓ 已移除旧Context")
+
+                self.context = None
+                self.page = None
+                self._context_wrapper = None
+
+                # 2. 从池中创建新Context
+                print(f"   正在创建新Context...")
+                self._context_wrapper = self.browser_pool.get_context(self.account_name, self.cookies)
+                if not self._context_wrapper:
+                    print(f"❌ 无法从浏览器池创建新Context")
+                    return False
+
+                self.context = self._context_wrapper.context
+                self.page = self._context_wrapper.page
+
+                # 3. 跳转到首页验证登录
+                try:
+                    self.page.goto("https://e.dianping.com/app/merchant-platform/", timeout=30000)
+                    time.sleep(2)
+                except Exception as e:
+                    print(f"   ⚠️ 首页加载失败: {e}")
+
+                # 4. 检查登录状态
+                is_logged_in, status = self._check_login_status()
+
+                if is_logged_in:
+                    self._context_wrapper.update_last_used()
+                    print(f"✅ 重新登录成功！（浏览器池模式）")
+                    self.login_invalid = False
+                    self.login_invalid_error = ""
+                    return True
+                else:
+                    print(f"❌ 重新登录失败: {status}")
+                    # 移除失败的Context
+                    self.browser_pool.remove_context(self.account_name)
+                    return False
+
+            # ========== 传统模式 ==========
             # 1. 关闭当前浏览器上下文（保留browser实例）
             if self.context:
                 try:
@@ -4638,13 +4691,6 @@ class PageDrivenTaskExecutor:
             if os.path.exists(self.state_file):
                 os.remove(self.state_file)
                 print(f"✓ 已删除旧状态文件: {self.state_file}")
-
-            # 3. 重新从API获取Cookie
-            print(f"🔍 正在从API重新获取账户 [{self.account_name}] 的Cookie...")
-            api_data = load_cookies_from_api(self.account_name)
-            self.cookies = api_data['cookies']
-            self.mtgsig = api_data['mtgsig']
-            print(f"✅ 成功加载 {len(self.cookies)} 个新cookies")
 
             # 4. 使用新Cookie创建浏览器上下文
             print("正在使用新Cookie登录...")
