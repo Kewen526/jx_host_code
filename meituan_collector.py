@@ -1742,10 +1742,21 @@ def ensure_template_id_with_browser(account_name: str, cookies: dict,
     if browser_pool:
         print("   使用浏览器池模式")
         try:
-            # 从浏览器池获取 Context
+            # 从浏览器池获取 Context（带自动重连）
             wrapper = browser_pool.get_context(account_name, cookies)
-            if not wrapper or not wrapper.page:
-                print("❌ 无法从浏览器池获取页面")
+            if not wrapper:
+                print("❌ 无法从浏览器池获取 Context")
+                log_failure(account_name, 0, "ensure_template_id", "", "",
+                           "无法从浏览器池获取 Context")
+                return None
+
+            # 验证 wrapper 有效性
+            if not wrapper.is_valid():
+                print("❌ 获取的 Context 无效")
+                log_failure(account_name, 0, "ensure_template_id", "", "",
+                           "获取的 Context 无效")
+                # 移除无效的 context
+                browser_pool.remove_context(account_name)
                 return None
 
             page = wrapper.page
@@ -1753,38 +1764,58 @@ def ensure_template_id_with_browser(account_name: str, cookies: dict,
             # ========== 检查登录状态 ==========
             print(f"\n🔐 检查登录状态...")
             login_check_url = "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html"
+
+            # 使用安全的页面跳转
+            if not wrapper.safe_goto(login_check_url, wait_until='domcontentloaded',
+                                      timeout=30000, max_retries=2):
+                print(f"   ❌ 登录检测页面跳转失败")
+                log_failure(account_name, 0, "ensure_template_id", "", "",
+                           "登录检测页面跳转失败，浏览器可能已关闭")
+                # 移除失效的 context
+                browser_pool.remove_context(account_name)
+                return None
+
+            time.sleep(2)
+
+            # 检查页面是否仍然有效
             try:
-                page.goto(login_check_url, wait_until='domcontentloaded', timeout=30000)
-                time.sleep(2)
-
                 current_url = page.url
-                if 'login' in current_url.lower():
-                    print(f"   ❌ 检测到登录失效（重定向到登录页）")
-                    print(f"   当前URL: {current_url}")
-                    report_auth_invalid(account_name)
-                    return None
+            except Exception as e:
+                print(f"   ❌ 获取页面URL失败: {e}")
+                log_failure(account_name, 0, "ensure_template_id", "", "",
+                           f"获取页面URL失败: {e}")
+                browser_pool.remove_context(account_name)
+                return None
 
+            if 'login' in current_url.lower():
+                print(f"   ❌ 检测到登录失效（重定向到登录页）")
+                print(f"   当前URL: {current_url}")
+                report_auth_invalid(account_name)
+                return None
+
+            try:
                 has_content = page.evaluate("() => document.body.textContent.length > 100")
                 if not has_content:
                     print(f"   ❌ 检测到登录失效（页面内容为空）")
                     report_auth_invalid(account_name)
                     return None
-
-                print(f"   ✅ 登录状态有效")
-
             except Exception as e:
-                error_msg = str(e).lower()
-                if 'timeout' in error_msg:
-                    print(f"   ⚠️ 登录检测超时，继续尝试...")
-                else:
-                    print(f"   ❌ 登录检测失败: {e}")
-                    report_auth_invalid(account_name)
-                    return None
+                print(f"   ⚠️ 页面内容检测失败: {e}")
+
+            print(f"   ✅ 登录状态有效")
 
             # ========== 跳转到报表中心页面 ==========
             print(f"\n📍 跳转到报表中心页面...")
             print(f"   URL: {REPORT_CENTER_URL[:80]}...")
-            page.goto(REPORT_CENTER_URL, wait_until='networkidle', timeout=BROWSER_PAGE_TIMEOUT)
+
+            # 使用安全的页面跳转
+            if not wrapper.safe_goto(REPORT_CENTER_URL, wait_until='networkidle',
+                                      timeout=BROWSER_PAGE_TIMEOUT, max_retries=2):
+                print(f"   ❌ 报表中心页面跳转失败")
+                log_failure(account_name, 0, "ensure_template_id", "", "",
+                           "报表中心页面跳转失败")
+                return None
+
             random_delay(2, 3)
             print("   ✅ 页面加载完成")
 
@@ -1793,7 +1824,21 @@ def ensure_template_id_with_browser(account_name: str, cookies: dict,
             return templates_id
 
         except Exception as e:
+            error_msg = str(e)
             print(f"❌ 浏览器池模式获取模板ID失败: {e}")
+
+            # 检测是否是浏览器关闭错误
+            if 'Target' in error_msg and 'closed' in error_msg.lower():
+                print("   检测到浏览器已关闭，移除失效 Context")
+                try:
+                    browser_pool.remove_context(account_name)
+                except Exception:
+                    pass
+
+            # 上报错误
+            log_failure(account_name, 0, "ensure_template_id", "", "",
+                       f"浏览器池模式失败: {error_msg}")
+
             import traceback
             traceback.print_exc()
             return None

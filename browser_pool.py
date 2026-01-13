@@ -78,6 +78,7 @@ API_BASE_URL = "http://8.146.210.145:3000"
 COOKIE_CONFIG_API = f"{API_BASE_URL}/api/cookie_config"
 PLATFORM_ACCOUNTS_API = f"{API_BASE_URL}/api/platform-accounts"
 GET_TASK_API = f"{API_BASE_URL}/api/get_task"
+ERROR_LOG_API = f"{API_BASE_URL}/api/log"
 
 # 获取公网IP的服务列表（按优先级）
 PUBLIC_IP_SERVICES = [
@@ -97,6 +98,117 @@ _server_ip: Optional[str] = None
 
 # 浏览器池运行状态
 _pool_running = True
+
+
+# ============================================================================
+# 日志工具函数
+# ============================================================================
+
+def log_print(message: str, level: str = "INFO"):
+    """带时间戳的日志打印
+
+    Args:
+        message: 日志消息
+        level: 日志级别 (INFO, WARN, ERROR)
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] [{level}] {message}")
+
+
+def log_info(message: str):
+    """INFO级别日志"""
+    log_print(message, "INFO")
+
+
+def log_warn(message: str):
+    """WARN级别日志"""
+    log_print(message, "WARN")
+
+
+def log_error(message: str, error: Exception = None, upload: bool = True,
+              context: str = None, account_id: str = None):
+    """ERROR级别日志，并可选上传到服务器
+
+    Args:
+        message: 错误消息
+        error: 异常对象
+        upload: 是否上传到服务器
+        context: 错误发生的上下文（如函数名）
+        account_id: 相关账号ID
+    """
+    import traceback
+
+    # 构建完整错误消息
+    full_message = message
+    if error:
+        full_message += f" | Exception: {type(error).__name__}: {str(error)}"
+
+    log_print(full_message, "ERROR")
+
+    # 上传到服务器
+    if upload:
+        try:
+            error_data = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "level": "ERROR",
+                "message": message,
+                "context": context or "browser_pool",
+                "account_id": account_id,
+                "error_type": type(error).__name__ if error else None,
+                "error_detail": str(error) if error else None,
+                "traceback": traceback.format_exc() if error else None,
+                "server_ip": _server_ip
+            }
+
+            response = requests.post(
+                ERROR_LOG_API,
+                json=error_data,
+                timeout=5  # 短超时，不阻塞主流程
+            )
+
+            if response.status_code != 200:
+                log_print(f"日志上传失败: HTTP {response.status_code}", "WARN")
+
+        except Exception as upload_error:
+            # 上传失败不影响主流程，只打印警告
+            log_print(f"日志上传异常: {upload_error}", "WARN")
+
+
+def upload_error_log(error_type: str, error_message: str,
+                     context: str = None, account_id: str = None,
+                     extra_data: dict = None):
+    """上传错误日志到服务器（独立函数）
+
+    Args:
+        error_type: 错误类型
+        error_message: 错误消息
+        context: 错误发生的上下文
+        account_id: 相关账号ID
+        extra_data: 额外数据
+    """
+    try:
+        error_data = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "level": "ERROR",
+            "error_type": error_type,
+            "message": error_message,
+            "context": context or "browser_pool",
+            "account_id": account_id,
+            "server_ip": _server_ip,
+            **(extra_data or {})
+        }
+
+        response = requests.post(
+            ERROR_LOG_API,
+            json=error_data,
+            timeout=5
+        )
+
+        return response.status_code == 200
+
+    except Exception as e:
+        log_print(f"日志上传异常: {e}", "WARN")
+        return False
 
 
 # ============================================================================
@@ -588,6 +700,134 @@ class ContextWrapper:
             'last_keepalive_at': self.last_keepalive_at.isoformat() if self.last_keepalive_at else None
         }
 
+    def is_valid(self) -> bool:
+        """检查 Context 和 Page 是否仍然有效
+
+        Returns:
+            bool: True 如果有效，False 如果已失效
+        """
+        try:
+            # 检查 context 是否存在
+            if not self.context:
+                log_warn(f"[{self.account_id}] Context 为空")
+                return False
+
+            # 检查 page 是否存在
+            if not self.page:
+                log_warn(f"[{self.account_id}] Page 为空")
+                return False
+
+            # 尝试执行一个简单操作来验证 context 是否可用
+            # 使用 context.cookies() 来验证，这是一个轻量级操作
+            self.context.cookies()
+
+            # 尝试检查 page 是否仍然可用
+            # 通过获取 page.url 来验证
+            _ = self.page.url
+
+            return True
+
+        except Exception as e:
+            log_warn(f"[{self.account_id}] Context/Page 健康检查失败: {e}")
+            return False
+
+    def safe_goto(self, url: str, wait_until: str = 'load',
+                  timeout: int = 60000, max_retries: int = 2) -> bool:
+        """安全的页面跳转，带异常处理和重试
+
+        Args:
+            url: 目标URL
+            wait_until: 等待条件 (load, domcontentloaded, networkidle)
+            timeout: 超时时间（毫秒）
+            max_retries: 最大重试次数
+
+        Returns:
+            bool: 是否成功跳转
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                # 先检查有效性
+                if not self.is_valid():
+                    log_error(
+                        f"[{self.account_id}] safe_goto 失败: Context/Page 已失效",
+                        context="ContextWrapper.safe_goto",
+                        account_id=self.account_id
+                    )
+                    return False
+
+                # 执行跳转
+                self.page.goto(url, wait_until=wait_until, timeout=timeout)
+                self.update_last_used()
+                return True
+
+            except Exception as e:
+                error_msg = str(e)
+
+                # 检查是否是 TargetClosedError
+                if 'Target' in error_msg and 'closed' in error_msg.lower():
+                    log_error(
+                        f"[{self.account_id}] safe_goto 失败: 浏览器已关闭",
+                        error=e,
+                        context="ContextWrapper.safe_goto",
+                        account_id=self.account_id
+                    )
+                    # 标记为无效，不再重试
+                    return False
+
+                # 其他错误，尝试重试
+                if attempt < max_retries:
+                    log_warn(f"[{self.account_id}] safe_goto 第{attempt}次失败，重试中: {e}")
+                    time.sleep(2)
+                else:
+                    log_error(
+                        f"[{self.account_id}] safe_goto 最终失败",
+                        error=e,
+                        context="ContextWrapper.safe_goto",
+                        account_id=self.account_id
+                    )
+                    return False
+
+        return False
+
+    def ensure_page(self) -> bool:
+        """确保 page 可用，如果不可用则尝试重新创建
+
+        Returns:
+            bool: Page 是否可用
+        """
+        # 如果 page 已存在且有效，直接返回
+        if self.page:
+            try:
+                _ = self.page.url
+                return True
+            except Exception:
+                log_warn(f"[{self.account_id}] 现有 Page 已失效，尝试重新创建")
+                self.page = None
+
+        # 尝试创建新 page
+        try:
+            if not self.context:
+                log_error(
+                    f"[{self.account_id}] 无法创建 Page: Context 不存在",
+                    context="ContextWrapper.ensure_page",
+                    account_id=self.account_id
+                )
+                return False
+
+            self.page = self.context.new_page()
+            self.page.set_default_timeout(60000)
+            log_info(f"[{self.account_id}] 成功重新创建 Page")
+            return True
+
+        except Exception as e:
+            log_error(
+                f"[{self.account_id}] 创建 Page 失败",
+                error=e,
+                context="ContextWrapper.ensure_page",
+                account_id=self.account_id
+            )
+            return False
+
 
 # ============================================================================
 # 浏览器池管理器
@@ -722,27 +962,116 @@ class BrowserPoolManager:
             print(f"   ❌ Browser {index} 创建失败: {e}")
             return None
 
+    def _is_browser_healthy(self, browser: Browser) -> bool:
+        """检查浏览器是否健康可用
+
+        Args:
+            browser: 浏览器实例
+
+        Returns:
+            bool: 是否健康
+        """
+        if browser is None:
+            return False
+
+        try:
+            # 检查 is_connected 属性（如果存在）
+            if hasattr(browser, 'is_connected'):
+                if not browser.is_connected():
+                    return False
+
+            # 尝试获取 contexts 列表来验证浏览器是否可用
+            # 这是一个轻量级操作
+            _ = browser.contexts
+            return True
+
+        except Exception as e:
+            log_warn(f"浏览器健康检查失败: {e}")
+            return False
+
+    def _rebuild_browser(self, index: int) -> Optional[Browser]:
+        """重建指定索引的浏览器
+
+        先清理失效的浏览器，再创建新的
+
+        Args:
+            index: 浏览器索引
+
+        Returns:
+            Browser: 新创建的浏览器，失败返回 None
+        """
+        log_info(f"正在重建 Browser {index}...")
+
+        # 清理旧浏览器
+        old_browser = self._browsers[index]
+        if old_browser:
+            try:
+                old_browser.close()
+            except Exception as e:
+                log_warn(f"关闭旧 Browser {index} 失败: {e}")
+
+            self._browsers[index] = None
+            self._browser_context_counts[index] = 0
+
+        # 清理关联的 Context
+        contexts_to_remove = []
+        for account_id, wrapper in self._contexts.items():
+            if wrapper.browser_index == index:
+                contexts_to_remove.append(account_id)
+
+        for account_id in contexts_to_remove:
+            try:
+                wrapper = self._contexts.pop(account_id)
+                wrapper.close()
+                log_info(f"清理失效 Context: {account_id}")
+            except Exception as e:
+                log_warn(f"清理 Context {account_id} 失败: {e}")
+
+        # 创建新浏览器
+        new_browser = self._create_browser(index)
+        if new_browser:
+            log_info(f"Browser {index} 重建成功")
+        else:
+            log_error(
+                f"Browser {index} 重建失败",
+                context="BrowserPoolManager._rebuild_browser"
+            )
+
+        return new_browser
+
     def _find_available_browser(self) -> Tuple[int, Browser]:
         """找到一个可用的Browser
 
-        优先选择Context数量最少的Browser
+        优先选择Context数量最少的健康Browser
+        如果找到不健康的Browser，自动重建
         如果都满了，创建新的Browser
 
         Returns:
             (browser_index, browser)
         """
-        # 找Context数量最少的Browser
+        # 找Context数量最少的健康Browser
         min_count = float('inf')
         min_index = -1
+        unhealthy_browsers = []
 
         for i, browser in enumerate(self._browsers):
             if browser is not None:
+                # 健康检查
+                if not self._is_browser_healthy(browser):
+                    log_warn(f"Browser {i} 健康检查失败，标记为需要重建")
+                    unhealthy_browsers.append(i)
+                    continue
+
                 count = self._browser_context_counts[i]
                 if count < self.max_contexts_per_browser and count < min_count:
                     min_count = count
                     min_index = i
 
-        # 如果找到了可用的Browser
+        # 重建不健康的浏览器
+        for i in unhealthy_browsers:
+            self._rebuild_browser(i)
+
+        # 如果找到了可用的健康Browser
         if min_index >= 0:
             return min_index, self._browsers[min_index]
 
@@ -753,51 +1082,133 @@ class BrowserPoolManager:
                 if browser:
                     return i, browser
 
+        # 所有Browser都满了，尝试重建一个之前失败的
+        for i in unhealthy_browsers:
+            if self._browsers[i] is not None:
+                return i, self._browsers[i]
+
         # 所有Browser都满了
+        log_error(
+            "浏览器池已满，无法创建新的Context",
+            context="BrowserPoolManager._find_available_browser"
+        )
         raise RuntimeError("浏览器池已满，无法创建新的Context")
 
-    def get_context(self, account_id: str, cookies: Dict = None) -> ContextWrapper:
+    def get_context(self, account_id: str, cookies: Dict = None,
+                    max_retries: int = 2) -> Optional[ContextWrapper]:
         """获取账号的Context
 
-        如果已存在，直接返回
+        如果已存在且有效，直接返回
+        如果已存在但失效，自动清理并重新创建
         如果不存在，创建新的Context并加载Cookie
+        包含自动重连和异常恢复机制
 
         Args:
             account_id: 账号ID
             cookies: Cookie字典（创建新Context时使用）
+            max_retries: 最大重试次数
 
         Returns:
-            ContextWrapper: Context包装器
+            ContextWrapper: Context包装器，失败返回 None
         """
-        with self._lock:
-            # 检查是否已存在
-            if account_id in self._contexts:
-                wrapper = self._contexts[account_id]
-                wrapper.update_last_used()
-                return wrapper
+        for attempt in range(1, max_retries + 1):
+            try:
+                with self._lock:
+                    # 检查是否已存在
+                    if account_id in self._contexts:
+                        wrapper = self._contexts[account_id]
 
-            # 创建新的Context
-            browser_index, browser = self._find_available_browser()
+                        # 健康检查
+                        if wrapper.is_valid():
+                            wrapper.update_last_used()
+                            return wrapper
+                        else:
+                            # Context 失效，清理并重新创建
+                            log_warn(f"[{account_id}] 已有 Context 失效，正在清理并重新创建...")
+                            upload_error_log(
+                                error_type="ContextInvalid",
+                                error_message=f"已有 Context 失效，正在重新创建",
+                                context="BrowserPoolManager.get_context",
+                                account_id=account_id
+                            )
 
-            # 创建Context
-            context = browser.new_context()
+                            # 清理失效的 wrapper
+                            browser_index = wrapper.browser_index
+                            try:
+                                wrapper.close()
+                            except Exception:
+                                pass
+                            del self._contexts[account_id]
+                            self._browser_context_counts[browser_index] = max(0, self._browser_context_counts[browser_index] - 1)
 
-            # 加载Cookie
-            if cookies:
-                playwright_cookies = self._convert_cookies(cookies)
-                context.add_cookies(playwright_cookies)
+                            # 使用保存的 cookies 或传入的 cookies
+                            if not cookies and wrapper.cookies:
+                                cookies = wrapper.cookies
 
-            # 创建包装器
-            wrapper = ContextWrapper(account_id, context, browser_index)
-            wrapper.cookies = cookies or {}
+                    # 创建新的Context
+                    browser_index, browser = self._find_available_browser()
 
-            # 保存到映射
-            self._contexts[account_id] = wrapper
-            self._browser_context_counts[browser_index] += 1
+                    # 再次验证浏览器健康状态
+                    if not self._is_browser_healthy(browser):
+                        log_warn(f"Browser {browser_index} 在创建 Context 前发现不健康，重建中...")
+                        browser = self._rebuild_browser(browser_index)
+                        if not browser:
+                            raise RuntimeError(f"Browser {browser_index} 重建失败")
 
-            print(f"   ✅ 为 {account_id} 创建新Context (Browser {browser_index})")
+                    # 创建Context
+                    try:
+                        context = browser.new_context()
+                    except Exception as e:
+                        error_msg = str(e)
+                        if 'Target' in error_msg and 'closed' in error_msg.lower():
+                            # 浏览器已关闭，需要重建
+                            log_warn(f"Browser {browser_index} 已关闭，尝试重建...")
+                            browser = self._rebuild_browser(browser_index)
+                            if browser:
+                                context = browser.new_context()
+                            else:
+                                raise RuntimeError(f"Browser {browser_index} 重建失败")
+                        else:
+                            raise
 
-            return wrapper
+                    # 加载Cookie
+                    if cookies:
+                        playwright_cookies = self._convert_cookies(cookies)
+                        context.add_cookies(playwright_cookies)
+
+                    # 创建包装器
+                    wrapper = ContextWrapper(account_id, context, browser_index)
+                    wrapper.cookies = cookies or {}
+
+                    # 保存到映射
+                    self._contexts[account_id] = wrapper
+                    self._browser_context_counts[browser_index] += 1
+
+                    log_info(f"为 {account_id} 创建新Context (Browser {browser_index})")
+
+                    return wrapper
+
+            except Exception as e:
+                log_error(
+                    f"[{account_id}] get_context 第 {attempt} 次尝试失败",
+                    error=e,
+                    context="BrowserPoolManager.get_context",
+                    account_id=account_id
+                )
+
+                if attempt < max_retries:
+                    log_info(f"[{account_id}] 等待 2 秒后重试...")
+                    time.sleep(2)
+                else:
+                    log_error(
+                        f"[{account_id}] get_context 最终失败，已重试 {max_retries} 次",
+                        error=e,
+                        context="BrowserPoolManager.get_context",
+                        account_id=account_id
+                    )
+                    return None
+
+        return None
 
     def _convert_cookies(self, cookies: Dict) -> List[Dict]:
         """将Cookie字典转换为Playwright格式"""
@@ -818,17 +1229,22 @@ class BrowserPoolManager:
             return account_id in self._contexts
 
     def remove_context(self, account_id: str):
-        """移除账号的Context"""
+        """移除账号的Context（安全处理异常）"""
         with self._lock:
             if account_id in self._contexts:
                 wrapper = self._contexts[account_id]
                 browser_index = wrapper.browser_index
 
-                wrapper.close()
-                del self._contexts[account_id]
-                self._browser_context_counts[browser_index] -= 1
+                # 安全关闭 wrapper（忽略错误）
+                try:
+                    wrapper.close()
+                except Exception as e:
+                    log_warn(f"关闭 {account_id} 的 Context 时出错: {e}")
 
-                print(f"   ✅ 已移除 {account_id} 的Context")
+                del self._contexts[account_id]
+                self._browser_context_counts[browser_index] = max(0, self._browser_context_counts[browser_index] - 1)
+
+                log_info(f"已移除 {account_id} 的Context")
 
     def get_all_account_ids(self) -> List[str]:
         """获取所有账号ID"""
@@ -971,10 +1387,50 @@ class BrowserPoolManager:
 
         return True
 
+    def _cleanup_dead_browsers(self):
+        """清理失效的浏览器
+
+        扫描所有浏览器实例，清理已失效的引用
+        注意：调用此方法前需要持有 _lock
+        """
+        for i, browser in enumerate(self._browsers):
+            if browser is not None and not self._is_browser_healthy(browser):
+                log_warn(f"发现失效浏览器 Browser {i}，正在清理...")
+
+                # 清理该浏览器上的所有 context
+                contexts_to_remove = [
+                    account_id for account_id, wrapper in self._contexts.items()
+                    if wrapper.browser_index == i
+                ]
+
+                for account_id in contexts_to_remove:
+                    try:
+                        wrapper = self._contexts.pop(account_id)
+                        try:
+                            wrapper.close()
+                        except Exception:
+                            pass
+                        log_info(f"清理失效浏览器上的 Context: {account_id}")
+                    except Exception as e:
+                        log_warn(f"清理 Context {account_id} 失败: {e}")
+
+                # 尝试关闭浏览器
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+                # 清理引用
+                self._browsers[i] = None
+                self._browser_context_counts[i] = 0
+
+                log_info(f"Browser {i} 已清理")
+
     def release_idle_contexts(self) -> int:
         """释放空闲的Context（资源紧张时调用）
 
         释放超过 CONTEXT_IDLE_TIMEOUT 未使用的 Context
+        同时检查并清理失效的浏览器
 
         Returns:
             int: 释放的Context数量
@@ -983,6 +1439,9 @@ class BrowserPoolManager:
         released = 0
 
         with self._lock:
+            # 先清理失效的浏览器
+            self._cleanup_dead_browsers()
+
             # 找出空闲的Context
             idle_accounts = []
             for account_id, wrapper in self._contexts.items():
@@ -999,20 +1458,27 @@ class BrowserPoolManager:
                     wrapper = self._contexts.pop(account_id)
                     browser_index = wrapper.browser_index
 
-                    # 先保存Cookie
-                    cookies = wrapper.get_cookies()
+                    # 先保存Cookie（忽略错误）
+                    try:
+                        cookies = wrapper.get_cookies()
+                    except Exception:
+                        pass
 
-                    wrapper.close()
-                    self._browser_context_counts[browser_index] -= 1
+                    try:
+                        wrapper.close()
+                    except Exception:
+                        pass
 
-                    print(f"   🗑️ 释放空闲Context: {account_id}（空闲 {int(idle_time/60)} 分钟）")
+                    self._browser_context_counts[browser_index] = max(0, self._browser_context_counts[browser_index] - 1)
+
+                    log_info(f"释放空闲Context: {account_id}（空闲 {int(idle_time/60)} 分钟）")
                     released += 1
 
                 except Exception as e:
-                    print(f"   ⚠️ 释放 {account_id} Context失败: {e}")
+                    log_warn(f"释放 {account_id} Context失败: {e}")
 
         if released > 0:
-            print(f"   ✅ 共释放 {released} 个空闲Context")
+            log_info(f"共释放 {released} 个空闲Context")
 
         return released
 
@@ -1021,11 +1487,15 @@ class BrowserPoolManager:
 
         当 Context 数量超过 MAX_ACTIVE_CONTEXTS 时，
         释放最久未使用的 Context
+        同时检查并清理失效的浏览器
 
         Returns:
             int: 释放的Context数量
         """
         with self._lock:
+            # 先清理失效的浏览器
+            self._cleanup_dead_browsers()
+
             current_count = len(self._contexts)
 
             if current_count <= MAX_ACTIVE_CONTEXTS:
@@ -1044,18 +1514,23 @@ class BrowserPoolManager:
             for account_id, wrapper in sorted_accounts[:to_release]:
                 try:
                     browser_index = wrapper.browser_index
-                    wrapper.close()
-                    del self._contexts[account_id]
-                    self._browser_context_counts[browser_index] -= 1
 
-                    print(f"   🗑️ 超限释放Context: {account_id}")
+                    try:
+                        wrapper.close()
+                    except Exception:
+                        pass
+
+                    del self._contexts[account_id]
+                    self._browser_context_counts[browser_index] = max(0, self._browser_context_counts[browser_index] - 1)
+
+                    log_info(f"超限释放Context: {account_id}")
                     released += 1
 
                 except Exception as e:
-                    print(f"   ⚠️ 释放 {account_id} Context失败: {e}")
+                    log_warn(f"释放 {account_id} Context失败: {e}")
 
             if released > 0:
-                print(f"   ✅ 超限释放 {released} 个Context（当前 {len(self._contexts)} 个）")
+                log_info(f"超限释放 {released} 个Context（当前 {len(self._contexts)} 个）")
 
             return released
 
@@ -1063,13 +1538,24 @@ class BrowserPoolManager:
         """紧急释放资源（资源危险时调用）
 
         释放一半的Context来降低资源占用
+        同时清理失效的浏览器
 
         Returns:
             int: 释放的Context数量
         """
-        print("\n🚨 紧急资源释放...")
+        log_warn("紧急资源释放...")
+
+        # 上传紧急释放事件
+        upload_error_log(
+            error_type="EmergencyRelease",
+            error_message="资源紧张，触发紧急释放",
+            context="BrowserPoolManager.emergency_release"
+        )
 
         with self._lock:
+            # 先清理失效的浏览器
+            self._cleanup_dead_browsers()
+
             current_count = len(self._contexts)
             if current_count == 0:
                 return 0
@@ -1087,17 +1573,22 @@ class BrowserPoolManager:
             for account_id, wrapper in sorted_accounts[:to_release]:
                 try:
                     browser_index = wrapper.browser_index
-                    wrapper.close()
-                    del self._contexts[account_id]
-                    self._browser_context_counts[browser_index] -= 1
 
-                    print(f"   🗑️ 紧急释放: {account_id}")
+                    try:
+                        wrapper.close()
+                    except Exception:
+                        pass
+
+                    del self._contexts[account_id]
+                    self._browser_context_counts[browser_index] = max(0, self._browser_context_counts[browser_index] - 1)
+
+                    log_info(f"紧急释放: {account_id}")
                     released += 1
 
                 except Exception as e:
-                    print(f"   ⚠️ 释放 {account_id} 失败: {e}")
+                    log_warn(f"释放 {account_id} 失败: {e}")
 
-            print(f"   ✅ 紧急释放完成: {released}/{to_release}（剩余 {len(self._contexts)} 个）")
+            log_info(f"紧急释放完成: {released}/{to_release}（剩余 {len(self._contexts)} 个）")
             return released
 
 
@@ -1280,12 +1771,14 @@ class KeepaliveService:
     def _keepalive_single(self, account_id: str) -> bool:
         """对单个账号执行保活
 
+        使用安全的页面跳转方法，自动处理浏览器失效
+
         Returns:
             bool: 是否成功
         """
         # 尝试获取锁（非阻塞）
         if not account_lock_manager.try_lock(account_id):
-            print(f"   ⏭️ {account_id} 正在执行任务，跳过保活")
+            log_info(f"{account_id} 正在执行任务，跳过保活")
             return False
 
         try:
@@ -1293,36 +1786,83 @@ class KeepaliveService:
                 return False
 
             wrapper = self.pool._contexts.get(account_id)
-            if not wrapper or not wrapper.page:
+            if not wrapper:
                 return False
 
-            print(f"   🔄 保活 {account_id}...")
+            # 使用健康检查验证 wrapper 是否有效
+            if not wrapper.is_valid():
+                log_warn(f"{account_id} Context 已失效，跳过保活并移除")
+                upload_error_log(
+                    error_type="ContextInvalid",
+                    error_message="保活时发现 Context 已失效",
+                    context="KeepaliveService._keepalive_single",
+                    account_id=account_id
+                )
+                # 移除失效的 context
+                self.pool.remove_context(account_id)
+                self._set_cooldown(account_id)
+                return False
 
-            # 访问保活页面（使用优化后的超时时间）
+            log_info(f"保活 {account_id}...")
+
+            # 使用安全的页面跳转
+            if not wrapper.safe_goto(KEEPALIVE_PAGE_URL, wait_until='load',
+                                      timeout=KEEPALIVE_TIMEOUT, max_retries=1):
+                log_warn(f"{account_id} 保活页面跳转失败")
+                upload_error_log(
+                    error_type="KeepaliveGotoFailed",
+                    error_message="保活页面跳转失败",
+                    context="KeepaliveService._keepalive_single",
+                    account_id=account_id
+                )
+                self._set_cooldown(account_id)
+                # 移除失效的 context
+                self.pool.remove_context(account_id)
+                return False
+
+            time.sleep(1)  # 等待页面加载
+
+            # 检查页面是否仍然有效
             try:
-                wrapper.page.goto(KEEPALIVE_PAGE_URL, timeout=KEEPALIVE_TIMEOUT)
-                time.sleep(1)  # 等待页面加载（缩短为1秒）
-
-                # 检查是否被重定向到登录页
                 current_url = wrapper.page.url
-                if 'login' in current_url.lower():
-                    print(f"   ⚠️ {account_id} Cookie已失效，上报失效状态")
-                    self._report_cookie_invalid(account_id)
-                    self._set_cooldown(account_id)  # 失效也设置冷却
-                    return False
+            except Exception as e:
+                log_error(
+                    f"{account_id} 获取页面URL失败",
+                    error=e,
+                    context="KeepaliveService._keepalive_single",
+                    account_id=account_id
+                )
+                self._set_cooldown(account_id)
+                self.pool.remove_context(account_id)
+                return False
 
-                # 获取并上传Cookie
+            # 检查是否被重定向到登录页
+            if 'login' in current_url.lower():
+                log_warn(f"{account_id} Cookie已失效，上报失效状态")
+                self._report_cookie_invalid(account_id)
+                self._set_cooldown(account_id)
+                return False
+
+            # 获取并上传Cookie
+            try:
                 cookies = wrapper.get_cookies()
                 cookie_upload_queue.put(account_id, cookies)
-
-                wrapper.update_last_keepalive()
-                print(f"   ✅ {account_id} 保活成功")
-                return True
-
             except Exception as e:
-                print(f"   ⚠️ {account_id} 保活失败: {e}")
-                self._set_cooldown(account_id)  # 失败设置冷却
-                return False
+                log_warn(f"{account_id} 获取Cookie失败: {e}")
+
+            wrapper.update_last_keepalive()
+            log_info(f"{account_id} 保活成功")
+            return True
+
+        except Exception as e:
+            log_error(
+                f"{account_id} 保活异常",
+                error=e,
+                context="KeepaliveService._keepalive_single",
+                account_id=account_id
+            )
+            self._set_cooldown(account_id)
+            return False
 
         finally:
             account_lock_manager.release(account_id)
