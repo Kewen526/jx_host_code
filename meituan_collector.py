@@ -113,6 +113,7 @@ TASK_SCHEDULE_API_URL = "http://8.146.210.145:3000/api/post_task_schedule"  # �
 GET_TASK_API_URL = "http://8.146.210.145:3000/api/get_task"  # 获取任务API
 TASK_CALLBACK_API_URL = "http://8.146.210.145:3000/api/task/callback"  # 任务完成回调API
 RESCHEDULE_FAILED_API_URL = "http://8.146.210.145:3000/api/task/reschedule-failed"  # 失败任务重新调度API
+TASK_RESET_API_URL = "http://8.146.210.145:3000/api/task/schedule/reset"  # 任务重置API（资源不足时归还任务）
 GET_PLATFORM_ACCOUNT_API_URL = "http://8.146.210.145:3000/api/get_platform_account"  # 获取平台账户信息API
 SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 
@@ -5385,6 +5386,44 @@ def report_task_callback(task_id: int, status: int, error_message: str, retry_ad
         return False
 
 
+def reset_task_schedule(task_id: int) -> bool:
+    """重置任务状态（资源不足时归还任务）
+
+    当资源状态为critical无法执行任务时，调用此接口将任务状态从1重置为0，
+    让任务重新进入待执行队列，避免任务丢失。
+
+    Args:
+        task_id: 任务ID
+
+    Returns:
+        bool: 是否重置成功
+    """
+    headers = {'Content-Type': 'application/json'}
+    json_param = {"id": task_id}
+    proxies = {'http': None, 'https': None}
+
+    print(f"   🔄 重置任务 {task_id}（资源不足，归还任务）...")
+
+    try:
+        response = requests.post(
+            TASK_RESET_API_URL,
+            headers=headers,
+            data=json.dumps(json_param),
+            proxies=proxies,
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            print(f"   ✅ 任务 {task_id} 已重置，将在资源恢复后重新执行")
+            return True
+        else:
+            print(f"   ❌ 任务重置失败: HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"   ❌ 任务重置异常: {e}")
+        return False
+
+
 def reschedule_failed_tasks() -> bool:
     """重新调度失败的任务
 
@@ -5797,6 +5836,10 @@ def main():
                     if status == resource_monitor.STATUS_CRITICAL:
                         print("\n🚨 资源危险！暂停任务执行，等待资源恢复...")
                         resource_monitor.print_status()
+                        # 重置任务状态，避免任务丢失
+                        task_id = task_info.get('id')
+                        if task_id:
+                            reset_task_schedule(task_id)
                         browser_pool_instance.emergency_release()
                         # 等待30秒后重试
                         if not interruptible_sleep(30):
