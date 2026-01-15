@@ -857,8 +857,8 @@ class BrowserPoolManager:
         # 账号到Context的映射
         self._contexts: Dict[str, ContextWrapper] = {}
 
-        # 线程锁
-        self._lock = threading.Lock()
+        # 线程锁（使用可重入锁，避免 restart_browsers 调用 get_context 时死锁）
+        self._lock = threading.RLock()
 
         # 状态
         self._initialized = False
