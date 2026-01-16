@@ -2036,7 +2036,8 @@ def kewen_is_valid_coupon_type(data):
     return coupon_code_type == '全部码'
 
 
-def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, templates_id: Optional[int] = None) -> Dict[str, Any]:
+def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, templates_id: Optional[int] = None,
+                           cookies: Dict = None, mtgsig: str = None) -> Dict[str, Any]:
     """执行kewen_daily_report任务
 
     Args:
@@ -2044,6 +2045,8 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
         start_date: 开始日期
         end_date: 结束日期
         templates_id: 报表模板ID（可选，如果传入则优先使用，不再从API重新获取）
+        cookies: 外部传入的Cookie（可选，避免重复调用API）
+        mtgsig: 外部传入的签名（可选）
     """
     table_name = "kewen_daily_report"
     print(f"\n{'=' * 60}")
@@ -2058,20 +2061,22 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
         disable_proxy()
         Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
 
-        # 加载cookies
-        api_data = load_cookies_from_api(account_name)
-        cookies = api_data['cookies']
-        mtgsig = api_data['mtgsig']
-        shop_info = api_data['shop_info']
+        # 优先使用外部传入的数据（页面驱动模式）
+        if cookies and mtgsig:
+            print(f"📌 使用共享 Cookie/签名（无需调用API）")
+            shop_info = []  # kewen_daily_report 不需要 shop_info
+        else:
+            # 没有外部数据，从API获取
+            api_data = load_cookies_from_api(account_name)
+            cookies = api_data['cookies']
+            mtgsig = api_data['mtgsig']
+            shop_info = api_data['shop_info']
+            if not templates_id:
+                templates_id = api_data['templates_id']
 
         # 如果外部传入了 templates_id，优先使用外部传入的值
         if templates_id:
-            print(f"📌 使用外部传入的 templates_id: {templates_id}")
-        else:
-            # 否则从API数据获取
-            templates_id = api_data['templates_id']
-            if templates_id:
-                print(f"📌 从API获取 templates_id: {templates_id}")
+            print(f"📌 使用 templates_id: {templates_id}")
 
         if not templates_id:
             raise Exception("未获取到报表模板ID")
@@ -2292,8 +2297,17 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
 # ============================================================================
 # promotion_daily_report 任务
 # ============================================================================
-def run_promotion_daily_report(account_name: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    """执行promotion_daily_report任务"""
+def run_promotion_daily_report(account_name: str, start_date: str, end_date: str,
+                               cookies: Dict = None, mtgsig: str = None) -> Dict[str, Any]:
+    """执行promotion_daily_report任务
+
+    Args:
+        account_name: 账户名称
+        start_date: 开始日期
+        end_date: 结束日期
+        cookies: 外部传入的Cookie（可选，避免重复调用API）
+        mtgsig: 外部传入的签名（可选）
+    """
     table_name = "promotion_daily_report"
     print(f"\n{'=' * 60}")
     print(f"📊 {table_name}")
@@ -2307,10 +2321,16 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
         disable_proxy()
         Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
 
-        api_data = load_cookies_from_api(account_name)
-        cookies = api_data['cookies']
-        mtgsig = api_data['mtgsig']
-        shop_info = api_data['shop_info']
+        # 优先使用外部传入的数据（页面驱动模式）
+        if cookies and mtgsig:
+            print(f"📌 使用共享 Cookie/签名（无需调用API）")
+            shop_info = []  # promotion_daily_report 不需要 shop_info
+        else:
+            # 没有外部数据，从API获取
+            api_data = load_cookies_from_api(account_name)
+            cookies = api_data['cookies']
+            mtgsig = api_data['mtgsig']
+            shop_info = api_data['shop_info']
         shop_ids = get_shop_ids(shop_info)
         year = start_date.split('-')[0]
 
@@ -2533,8 +2553,18 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
 # ============================================================================
 # review_detail_dianping 任务
 # ============================================================================
-def run_review_detail_dianping(account_name: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    """执行review_detail_dianping任务"""
+def run_review_detail_dianping(account_name: str, start_date: str, end_date: str,
+                               cookies: Dict = None, mtgsig: str = None, shop_info: List = None) -> Dict[str, Any]:
+    """执行review_detail_dianping任务
+
+    Args:
+        account_name: 账户名称
+        start_date: 开始日期
+        end_date: 结束日期
+        cookies: 外部传入的Cookie（可选，避免重复调用API）
+        mtgsig: 外部传入的签名（可选）
+        shop_info: 外部传入的门店信息（可选）
+    """
     table_name = "review_detail_dianping"
     print(f"\n{'=' * 60}")
     print(f"💬 {table_name}")
@@ -2544,10 +2574,18 @@ def run_review_detail_dianping(account_name: str, start_date: str, end_date: str
 
     try:
         disable_proxy()
-        api_data = load_cookies_from_api(account_name)
-        cookies = api_data['cookies']
-        mtgsig = api_data['mtgsig']
-        shop_info = api_data['shop_info']
+
+        # 优先使用外部传入的数据（页面驱动模式）
+        if cookies and mtgsig:
+            print(f"📌 使用共享 Cookie/签名（无需调用API）")
+            if not shop_info:
+                shop_info = []
+        else:
+            # 没有外部数据，从API获取
+            api_data = load_cookies_from_api(account_name)
+            cookies = api_data['cookies']
+            mtgsig = api_data['mtgsig']
+            shop_info = api_data['shop_info']
         shop_ids = get_shop_ids(shop_info)
 
         headers = {
@@ -2759,8 +2797,18 @@ def run_review_detail_dianping(account_name: str, start_date: str, end_date: str
 # ============================================================================
 # review_detail_meituan 任务
 # ============================================================================
-def run_review_detail_meituan(account_name: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    """执行review_detail_meituan任务"""
+def run_review_detail_meituan(account_name: str, start_date: str, end_date: str,
+                              cookies: Dict = None, mtgsig: str = None, shop_info: List = None) -> Dict[str, Any]:
+    """执行review_detail_meituan任务
+
+    Args:
+        account_name: 账户名称
+        start_date: 开始日期
+        end_date: 结束日期
+        cookies: 外部传入的Cookie（可选，避免重复调用API）
+        mtgsig: 外部传入的签名（可选）
+        shop_info: 外部传入的门店信息（可选）
+    """
     table_name = "review_detail_meituan"
     print(f"\n{'=' * 60}")
     print(f"🍔 {table_name}")
@@ -2770,10 +2818,18 @@ def run_review_detail_meituan(account_name: str, start_date: str, end_date: str)
 
     try:
         disable_proxy()
-        api_data = load_cookies_from_api(account_name)
-        cookies = api_data['cookies']
-        mtgsig = api_data['mtgsig']
-        shop_info = api_data['shop_info']
+
+        # 优先使用外部传入的数据（页面驱动模式）
+        if cookies and mtgsig:
+            print(f"📌 使用共享 Cookie/签名（无需调用API）")
+            if not shop_info:
+                shop_info = []
+        else:
+            # 没有外部数据，从API获取
+            api_data = load_cookies_from_api(account_name)
+            cookies = api_data['cookies']
+            mtgsig = api_data['mtgsig']
+            shop_info = api_data['shop_info']
         shop_ids = get_shop_ids(shop_info)
 
         headers = {
@@ -2988,8 +3044,18 @@ def run_review_detail_meituan(account_name: str, start_date: str, end_date: str)
 # ============================================================================
 # review_summary_dianping 任务
 # ============================================================================
-def run_review_summary_dianping(account_name: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    """执行review_summary_dianping任务"""
+def run_review_summary_dianping(account_name: str, start_date: str, end_date: str,
+                                cookies: Dict = None, mtgsig: str = None, shop_info: List = None) -> Dict[str, Any]:
+    """执行review_summary_dianping任务
+
+    Args:
+        account_name: 账户名称
+        start_date: 开始日期
+        end_date: 结束日期
+        cookies: 外部传入的Cookie（可选，避免重复调用API）
+        mtgsig: 外部传入的签名（可选）
+        shop_info: 外部传入的门店信息（可选）
+    """
     table_name = "review_summary_dianping"
     print(f"\n{'=' * 60}")
     print(f"💬 {table_name}")
@@ -3001,10 +3067,17 @@ def run_review_summary_dianping(account_name: str, start_date: str, end_date: st
         disable_proxy()
         Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
 
-        api_data = load_cookies_from_api(account_name)
-        cookies = api_data['cookies']
-        mtgsig = api_data['mtgsig']
-        shop_info = api_data['shop_info']
+        # 优先使用外部传入的数据（页面驱动模式）
+        if cookies and mtgsig:
+            print(f"📌 使用共享 Cookie/签名（无需调用API）")
+            if not shop_info:
+                shop_info = []
+        else:
+            # 没有外部数据，从API获取
+            api_data = load_cookies_from_api(account_name)
+            cookies = api_data['cookies']
+            mtgsig = api_data['mtgsig']
+            shop_info = api_data['shop_info']
         shop_ids = get_shop_ids(shop_info)
 
         headers = {
@@ -3221,8 +3294,18 @@ def run_review_summary_dianping(account_name: str, start_date: str, end_date: st
 # ============================================================================
 # review_summary_meituan 任务
 # ============================================================================
-def run_review_summary_meituan(account_name: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    """执行review_summary_meituan任务"""
+def run_review_summary_meituan(account_name: str, start_date: str, end_date: str,
+                               cookies: Dict = None, mtgsig: str = None, shop_info: List = None) -> Dict[str, Any]:
+    """执行review_summary_meituan任务
+
+    Args:
+        account_name: 账户名称
+        start_date: 开始日期
+        end_date: 结束日期
+        cookies: 外部传入的Cookie（可选，避免重复调用API）
+        mtgsig: 外部传入的签名（可选）
+        shop_info: 外部传入的门店信息（可选）
+    """
     table_name = "review_summary_meituan"
     print(f"\n{'=' * 60}")
     print(f"🍔 {table_name}")
@@ -3234,10 +3317,17 @@ def run_review_summary_meituan(account_name: str, start_date: str, end_date: str
         disable_proxy()
         Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
 
-        api_data = load_cookies_from_api(account_name)
-        cookies = api_data['cookies']
-        mtgsig = api_data['mtgsig']
-        shop_info = api_data['shop_info']
+        # 优先使用外部传入的数据（页面驱动模式）
+        if cookies and mtgsig:
+            print(f"📌 使用共享 Cookie/签名（无需调用API）")
+            if not shop_info:
+                shop_info = []
+        else:
+            # 没有外部数据，从API获取
+            api_data = load_cookies_from_api(account_name)
+            cookies = api_data['cookies']
+            mtgsig = api_data['mtgsig']
+            shop_info = api_data['shop_info']
         shop_ids = get_shop_ids(shop_info)
 
         headers = {
@@ -3460,7 +3550,8 @@ def run_review_summary_meituan(account_name: str, start_date: str, end_date: str
 class DianpingStoreStats:
     """大众点评门店统计数据采集类（带Playwright支持）"""
 
-    def __init__(self, account_name: str, platform_api_url: str, headless: bool = True, disable_proxy: bool = True, external_page=None):
+    def __init__(self, account_name: str, platform_api_url: str, headless: bool = True, disable_proxy: bool = True,
+                 external_page=None, cookies: Dict = None, mtgsig: str = None, shop_info: List = None):
         """初始化
 
         Args:
@@ -3469,6 +3560,9 @@ class DianpingStoreStats:
             headless: 是否使用无头模式
             disable_proxy: 是否禁用代理
             external_page: 外部传入的 Playwright page 对象（用于页面驱动模式）
+            cookies: 外部传入的Cookie（可选，避免重复调用API）
+            mtgsig: 外部传入的签名（可选）
+            shop_info: 外部传入的门店信息（可选）
         """
         self.account_name = account_name
         self.platform_api_url = platform_api_url
@@ -3499,6 +3593,11 @@ class DianpingStoreStats:
         self.shop_region_info = {}
         self.cookie_data = None
 
+        # 外部传入的数据（页面驱动模式，避免重复调用API）
+        self._external_cookies = cookies
+        self._external_mtgsig = mtgsig
+        self._external_shop_info = shop_info
+
         if self.disable_proxy:
             self._disable_proxy()
 
@@ -3527,8 +3626,46 @@ class DianpingStoreStats:
         return session
 
     def _load_account_info_from_api(self):
-        """从API接口加载账户信息"""
+        """加载账户信息（优先使用外部传入数据，没有才调用API）"""
         try:
+            # 检查是否有外部传入的数据（页面驱动模式）
+            if self._external_cookies and self._external_shop_info:
+                print(f"📌 使用外部传入的 Cookie/签名/门店信息（无需调用API）")
+
+                # 使用外部传入的数据
+                self.cookies = self._external_cookies
+                print(f"✅ 成功加载 {len(self.cookies)} 个cookies（来自共享数据）")
+
+                if self._external_mtgsig:
+                    self.mtgsig_from_api = self._external_mtgsig
+                    print(f"   已获取mtgsig: {self.mtgsig_from_api[:50]}...")
+
+                # 处理门店信息（可能是列表或字典格式）
+                if isinstance(self._external_shop_info, list):
+                    self.shop_list = self._external_shop_info
+                elif isinstance(self._external_shop_info, dict):
+                    # 如果是字典，尝试提取门店列表
+                    self.shop_list = [self._external_shop_info] if self._external_shop_info.get('shop_id') else []
+                else:
+                    self.shop_list = []
+
+                if self.shop_list:
+                    print(f"✅ 成功加载 {len(self.shop_list)} 个门店（来自共享数据）")
+                    for shop in self.shop_list:
+                        print(f"   - {shop.get('shop_name')} ({shop.get('shop_id')})")
+                else:
+                    # 门店信息为空，需要从API获取
+                    print(f"⚠️ 共享数据中无门店信息，从API补充获取...")
+                    self._fetch_additional_info_from_api()
+
+                # 获取店铺ID
+                self.shop_id = self.cookies.get('mpmerchant_portal_shopid', '')
+                if not self.shop_id and self.shop_list:
+                    self.shop_id = self.shop_list[0].get('shop_id')
+
+                return
+
+            # 没有外部数据，从API获取完整信息
             print(f"🔍 正在从API获取账户 [{self.account_name}] 的完整信息...")
             headers = {'Content-Type': 'application/json'}
             data = json.dumps({"account": self.account_name})
@@ -3594,6 +3731,49 @@ class DianpingStoreStats:
         except Exception as e:
             print(f"❌ 加载账户信息失败: {e}")
             raise
+
+    def _fetch_additional_info_from_api(self):
+        """从API补充获取额外信息（门店列表、团购映射、商圈信息）"""
+        try:
+            headers = {'Content-Type': 'application/json'}
+            data = json.dumps({"account": self.account_name})
+
+            session = self._get_session()
+            response = session.post(self.platform_api_url, headers=headers, data=data, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+
+            if not result or not result.get('success'):
+                return
+
+            data = result.get('data', {})
+            if not data:
+                return
+
+            self.cookie_data = data
+
+            # 获取门店列表
+            stores_json = data.get('stores_json', [])
+            if stores_json:
+                self.shop_list = stores_json
+                print(f"✅ 成功加载 {len(self.shop_list)} 个门店")
+                for shop in self.shop_list:
+                    print(f"   - {shop.get('shop_name')} ({shop.get('shop_id')})")
+
+            # 获取团购ID映射
+            brands_json = data.get('brands_json', [])
+            if brands_json:
+                self.product_mapping = brands_json
+                print(f"✅ 成功加载 {len(self.product_mapping)} 个团购ID映射")
+
+            # 获取门店商圈信息
+            compare_regions = data.get('compareRegions_json', {})
+            if compare_regions:
+                self.shop_region_info = compare_regions
+                print(f"✅ 成功加载 {len(self.shop_region_info)} 个门店商圈信息")
+
+        except Exception as e:
+            print(f"⚠️ 补充获取信息失败: {e}")
 
     def _install_browser(self):
         """自动安装Playwright浏览器"""
@@ -4365,7 +4545,8 @@ class DianpingStoreStats:
 # ============================================================================
 # run_store_stats 任务函数
 # ============================================================================
-def run_store_stats(account_name: str, start_date: str, end_date: str, external_page=None) -> Dict[str, Any]:
+def run_store_stats(account_name: str, start_date: str, end_date: str, external_page=None,
+                    cookies: Dict = None, mtgsig: str = None, shop_info: List = None) -> Dict[str, Any]:
     """执行store_stats任务 - 门店统计数据采集
 
     Args:
@@ -4373,6 +4554,9 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
         start_date: 开始日期
         end_date: 结束日期
         external_page: 外部传入的 Playwright page 对象（用于页面驱动模式）
+        cookies: 外部传入的Cookie（可选，避免重复调用API）
+        mtgsig: 外部传入的签名（可选）
+        shop_info: 外部传入的门店信息（可选）
     """
     table_name = "store_stats"
     print(f"\n{'=' * 60}")
@@ -4407,13 +4591,16 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
     try:
         disable_proxy()
 
-        # 创建采集器
+        # 创建采集器（传递外部数据，避免重复调用API）
         collector = DianpingStoreStats(
             account_name,
             PLATFORM_ACCOUNTS_API_URL,
             headless=HEADLESS,
             disable_proxy=True,
-            external_page=external_page
+            external_page=external_page,
+            cookies=cookies,
+            mtgsig=mtgsig,
+            shop_info=shop_info
         )
 
         # 执行采集和上传
@@ -4526,14 +4713,51 @@ class PageDrivenTaskExecutor:
         print("✅ 已禁用系统代理")
 
     def _load_account_info(self):
-        """从API加载账户信息"""
-        print(f"\n🔍 正在从API获取账户 [{self.account_name}] 的信息...")
-        api_data = load_cookies_from_api(self.account_name)
-        self.cookies = api_data['cookies']
-        self.mtgsig = api_data['mtgsig']
-        self.shop_info = api_data['shop_info']
-        self.templates_id = api_data['templates_id']
-        print(f"✅ 账户信息加载完成")
+        """加载账户信息（优先从浏览器池获取Cookie，没有才调用API）
+
+        优先级：
+        1. 浏览器池中已有该账号的Context -> 直接使用其Cookie
+        2. 浏览器池没有 -> 从API获取完整信息
+
+        注意：mtgsig, shop_info, templates_id 始终从API获取（浏览器池不存储这些）
+        """
+        # 检查浏览器池是否已有该账号的Cookie
+        pool_cookies = None
+        if self.browser_pool and self.browser_pool.has_context(self.account_name):
+            try:
+                wrapper = self.browser_pool._contexts.get(self.account_name)
+                if wrapper and wrapper.cookies:
+                    pool_cookies = wrapper.cookies
+                    print(f"\n✅ 从浏览器池获取 Cookie（{len(pool_cookies)} 个）")
+            except Exception as e:
+                print(f"\n⚠️ 从浏览器池获取Cookie失败: {e}，将从API获取")
+
+        if pool_cookies:
+            # 使用浏览器池的Cookie
+            self.cookies = pool_cookies
+            # 但仍需从API获取 mtgsig, shop_info, templates_id
+            print(f"🔍 正在从API获取账户 [{self.account_name}] 的其他信息（mtgsig/shop_info/templates_id）...")
+            api_data = load_cookies_from_api(self.account_name)
+            self.mtgsig = api_data['mtgsig']
+            self.shop_info = api_data['shop_info']
+            self.templates_id = api_data['templates_id']
+            print(f"✅ 账户信息加载完成（Cookie来自浏览器池）")
+        else:
+            # 浏览器池没有，从API获取完整信息
+            print(f"\n🔍 正在从API获取账户 [{self.account_name}] 的完整信息...")
+            api_data = load_cookies_from_api(self.account_name)
+            self.cookies = api_data['cookies']
+            self.mtgsig = api_data['mtgsig']
+            self.shop_info = api_data['shop_info']
+            self.templates_id = api_data['templates_id']
+            print(f"✅ 账户信息加载完成（来自API）")
+
+        # 初始化 SHARED_SIGNATURE（供后续任务共享使用）
+        global SHARED_SIGNATURE
+        SHARED_SIGNATURE['cookies'] = self.cookies
+        SHARED_SIGNATURE['mtgsig'] = self.mtgsig
+        SHARED_SIGNATURE['shop_list'] = self.shop_info
+        SHARED_SIGNATURE['updated_at'] = datetime.now()
 
     def _convert_cookies_to_playwright_format(self) -> list:
         """将cookie字典转换为Playwright格式"""
@@ -4715,6 +4939,14 @@ class PageDrivenTaskExecutor:
                 # 重置登录失效标志
                 self.login_invalid = False
                 self.login_invalid_error = ""
+
+                # 7. 更新 SHARED_SIGNATURE（供后续任务使用新的Cookie/签名）
+                global SHARED_SIGNATURE
+                SHARED_SIGNATURE['cookies'] = self.cookies
+                SHARED_SIGNATURE['mtgsig'] = self.mtgsig
+                SHARED_SIGNATURE['updated_at'] = datetime.now()
+                print(f"✅ 已更新共享签名（重新登录后）")
+
                 return True
             else:
                 # 7. 登录失败
@@ -5020,15 +5252,45 @@ class PageDrivenTaskExecutor:
             print(f"▶ 开始执行任务: {task_name}")
             print(f"{'─' * 50}")
 
+            # 获取最新的共享数据（可能被前一个任务更新，如 store_stats 更新签名）
+            current_cookies = SHARED_SIGNATURE.get('cookies') or self.cookies
+            current_mtgsig = SHARED_SIGNATURE.get('mtgsig') or self.mtgsig
+            current_shop_info = SHARED_SIGNATURE.get('shop_list') or self.shop_info
+
             task_func = TASK_MAP.get(task_name)
             if task_func:
-                # 对于 store_stats 任务，传递当前 page 对象（页面驱动模式）
+                # 所有任务都传递共享的 cookies, mtgsig, shop_info（避免重复调用API）
                 if task_name == 'store_stats':
-                    result = task_func(self.account_name, start_date, end_date, external_page=self.page)
-                # 对于 kewen_daily_report 任务，传递已获取的 templates_id（避免重新从API获取空值）
+                    result = task_func(
+                        self.account_name, start_date, end_date,
+                        external_page=self.page,
+                        cookies=current_cookies,
+                        mtgsig=current_mtgsig,
+                        shop_info=current_shop_info
+                    )
                 elif task_name == 'kewen_daily_report':
-                    result = task_func(self.account_name, start_date, end_date, templates_id=self.templates_id)
+                    result = task_func(
+                        self.account_name, start_date, end_date,
+                        templates_id=self.templates_id,
+                        cookies=current_cookies,
+                        mtgsig=current_mtgsig
+                    )
+                elif task_name == 'promotion_daily_report':
+                    result = task_func(
+                        self.account_name, start_date, end_date,
+                        cookies=current_cookies,
+                        mtgsig=current_mtgsig
+                    )
+                elif task_name in ('review_detail_dianping', 'review_detail_meituan',
+                                   'review_summary_dianping', 'review_summary_meituan'):
+                    result = task_func(
+                        self.account_name, start_date, end_date,
+                        cookies=current_cookies,
+                        mtgsig=current_mtgsig,
+                        shop_info=current_shop_info
+                    )
                 else:
+                    # 其他任务（兼容）
                     result = task_func(self.account_name, start_date, end_date)
                 results.append(result)
 
