@@ -2124,9 +2124,14 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
 
             # 检查请求是否成功
             result_type = resp_json.get('data', {}).get('resultType')
+            result_msg = resp_json.get('data', {}).get('resultMsg', '')
             if result_type == 3:
                 # 服务异常，需要重试（使用指数退避）
-                last_error_message = f"服务异常 (resultType={result_type})"
+                # 上传完整的美团返回的 resultMsg，而不是简化的错误信息
+                if result_msg:
+                    last_error_message = f"服务异常 (resultType={result_type}): {result_msg}"
+                else:
+                    last_error_message = f"服务异常 (resultType={result_type})"
                 print(f"⚠️ 第 {retry_attempt} 次尝试失败: {last_error_message}")
                 if retry_attempt < MAX_RETRY_ATTEMPTS:
                     delay = calculate_retry_delay(retry_attempt)
@@ -5884,6 +5889,23 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
             'error_message': error_msg
         }])
         report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        return False
+
+    # 检查 auth_status 是否为无效状态
+    auth_status = platform_account.get('auth_status')
+    if auth_status == 'invalid':
+        error_msg = f"账户Cookie已失效(auth_status=invalid)，请重新登录"
+        print(f"❌ {error_msg}")
+        # 同时上报到两个日志接口
+        log_failure(account_name, 0, "auth_status_check", start_date, end_date, error_msg)
+        upload_task_status_batch(account_name, start_date, end_date, [{
+            'task_name': 'auth_status_check',
+            'success': False,
+            'record_count': 0,
+            'error_message': error_msg
+        }])
+        # retry_add=0 避免无效重试（Cookie未更新时重试没有意义）
+        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=0)
         return False
 
     templates_id = platform_account.get('templates_id')
