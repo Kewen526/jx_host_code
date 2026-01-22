@@ -329,6 +329,8 @@ SHARED_SIGNATURE = {
     'cookies': None,         # 更新后的cookies
     'updated_at': None,      # 更新时间
     'shop_list': None,       # 门店列表
+    'compare_regions': None, # 门店商圈信息（用于同行排名）
+    'brands_json': None,     # 团购ID映射（用于广告单）
 }
 
 
@@ -1164,13 +1166,25 @@ def load_cookies_from_api(account_name: str) -> Dict[str, Any]:
         # 获取templates_id
         templates_id = record.get('templates_id')
 
+        # 获取门店商圈信息（用于同行排名数据）
+        compare_regions = record.get('compareRegions_json', {})
+
+        # 获取团购ID映射（用于广告单数据）
+        brands_json = record.get('brands_json', [])
+
         print(f"✅ 成功加载 {len(cookies)} 个cookies")
+        if compare_regions:
+            print(f"✅ 成功加载 {len(compare_regions)} 个门店商圈信息")
+        if brands_json:
+            print(f"✅ 成功加载 {len(brands_json)} 个团购ID映射")
 
         return {
             'cookies': cookies,
             'mtgsig': mtgsig,
             'shop_info': shop_info,
-            'templates_id': templates_id
+            'templates_id': templates_id,
+            'compare_regions': compare_regions,
+            'brands_json': brands_json
         }
     finally:
         session.close()
@@ -3556,7 +3570,8 @@ class DianpingStoreStats:
     """大众点评门店统计数据采集类（带Playwright支持）"""
 
     def __init__(self, account_name: str, platform_api_url: str, headless: bool = True, disable_proxy: bool = True,
-                 external_page=None, cookies: Dict = None, mtgsig: str = None, shop_info: List = None):
+                 external_page=None, cookies: Dict = None, mtgsig: str = None, shop_info: List = None,
+                 compare_regions: Dict = None, brands_json: List = None):
         """初始化
 
         Args:
@@ -3568,6 +3583,8 @@ class DianpingStoreStats:
             cookies: 外部传入的Cookie（可选，避免重复调用API）
             mtgsig: 外部传入的签名（可选）
             shop_info: 外部传入的门店信息（可选）
+            compare_regions: 外部传入的门店商圈信息（可选，用于同行排名）
+            brands_json: 外部传入的团购ID映射（可选，用于广告单）
         """
         self.account_name = account_name
         self.platform_api_url = platform_api_url
@@ -3602,6 +3619,8 @@ class DianpingStoreStats:
         self._external_cookies = cookies
         self._external_mtgsig = mtgsig
         self._external_shop_info = shop_info
+        self._external_compare_regions = compare_regions
+        self._external_brands_json = brands_json
 
         if self.disable_proxy:
             self._disable_proxy()
@@ -3662,6 +3681,16 @@ class DianpingStoreStats:
                     # 门店信息为空，需要从API获取
                     print(f"⚠️ 共享数据中无门店信息，从API补充获取...")
                     self._fetch_additional_info_from_api()
+
+                # 处理门店商圈信息（用于同行排名）
+                if self._external_compare_regions:
+                    self.shop_region_info = self._external_compare_regions
+                    print(f"✅ 成功加载 {len(self.shop_region_info)} 个门店商圈信息（来自共享数据）")
+
+                # 处理团购ID映射（用于广告单）
+                if self._external_brands_json:
+                    self.product_mapping = self._external_brands_json
+                    print(f"✅ 成功加载 {len(self.product_mapping)} 个团购ID映射（来自共享数据）")
 
                 # 获取店铺ID
                 self.shop_id = self.cookies.get('mpmerchant_portal_shopid', '')
@@ -4551,7 +4580,8 @@ class DianpingStoreStats:
 # run_store_stats 任务函数
 # ============================================================================
 def run_store_stats(account_name: str, start_date: str, end_date: str, external_page=None,
-                    cookies: Dict = None, mtgsig: str = None, shop_info: List = None) -> Dict[str, Any]:
+                    cookies: Dict = None, mtgsig: str = None, shop_info: List = None,
+                    compare_regions: Dict = None, brands_json: List = None) -> Dict[str, Any]:
     """执行store_stats任务 - 门店统计数据采集
 
     Args:
@@ -4562,6 +4592,8 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
         cookies: 外部传入的Cookie（可选，避免重复调用API）
         mtgsig: 外部传入的签名（可选）
         shop_info: 外部传入的门店信息（可选）
+        compare_regions: 外部传入的门店商圈信息（可选，用于同行排名）
+        brands_json: 外部传入的团购ID映射（可选，用于广告单）
     """
     table_name = "store_stats"
     print(f"\n{'=' * 60}")
@@ -4605,7 +4637,9 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
             external_page=external_page,
             cookies=cookies,
             mtgsig=mtgsig,
-            shop_info=shop_info
+            shop_info=shop_info,
+            compare_regions=compare_regions,
+            brands_json=brands_json
         )
 
         # 执行采集和上传
@@ -4696,6 +4730,8 @@ class PageDrivenTaskExecutor:
         self.mtgsig = None
         self.shop_info = {}
         self.templates_id = None
+        self.compare_regions = {}  # 门店商圈信息（用于同行排名）
+        self.brands_json = []      # 团购ID映射（用于广告单）
 
         # 执行结果
         self.results = []
@@ -4740,12 +4776,14 @@ class PageDrivenTaskExecutor:
         if pool_cookies:
             # 使用浏览器池的Cookie
             self.cookies = pool_cookies
-            # 但仍需从API获取 mtgsig, shop_info, templates_id
-            print(f"🔍 正在从API获取账户 [{self.account_name}] 的其他信息（mtgsig/shop_info/templates_id）...")
+            # 但仍需从API获取 mtgsig, shop_info, templates_id, compare_regions, brands_json
+            print(f"🔍 正在从API获取账户 [{self.account_name}] 的其他信息...")
             api_data = load_cookies_from_api(self.account_name)
             self.mtgsig = api_data['mtgsig']
             self.shop_info = api_data['shop_info']
             self.templates_id = api_data['templates_id']
+            self.compare_regions = api_data.get('compare_regions', {})
+            self.brands_json = api_data.get('brands_json', [])
             print(f"✅ 账户信息加载完成（Cookie来自浏览器池）")
         else:
             # 浏览器池没有，从API获取完整信息
@@ -4755,6 +4793,8 @@ class PageDrivenTaskExecutor:
             self.mtgsig = api_data['mtgsig']
             self.shop_info = api_data['shop_info']
             self.templates_id = api_data['templates_id']
+            self.compare_regions = api_data.get('compare_regions', {})
+            self.brands_json = api_data.get('brands_json', [])
             print(f"✅ 账户信息加载完成（来自API）")
 
         # 初始化 SHARED_SIGNATURE（供后续任务共享使用）
@@ -4762,6 +4802,8 @@ class PageDrivenTaskExecutor:
         SHARED_SIGNATURE['cookies'] = self.cookies
         SHARED_SIGNATURE['mtgsig'] = self.mtgsig
         SHARED_SIGNATURE['shop_list'] = self.shop_info
+        SHARED_SIGNATURE['compare_regions'] = self.compare_regions
+        SHARED_SIGNATURE['brands_json'] = self.brands_json
         SHARED_SIGNATURE['updated_at'] = datetime.now()
 
     def _convert_cookies_to_playwright_format(self) -> list:
@@ -5261,6 +5303,8 @@ class PageDrivenTaskExecutor:
             current_cookies = SHARED_SIGNATURE.get('cookies') or self.cookies
             current_mtgsig = SHARED_SIGNATURE.get('mtgsig') or self.mtgsig
             current_shop_info = SHARED_SIGNATURE.get('shop_list') or self.shop_info
+            current_compare_regions = SHARED_SIGNATURE.get('compare_regions') or self.compare_regions
+            current_brands_json = SHARED_SIGNATURE.get('brands_json') or self.brands_json
 
             task_func = TASK_MAP.get(task_name)
             if task_func:
@@ -5271,7 +5315,9 @@ class PageDrivenTaskExecutor:
                         external_page=self.page,
                         cookies=current_cookies,
                         mtgsig=current_mtgsig,
-                        shop_info=current_shop_info
+                        shop_info=current_shop_info,
+                        compare_regions=current_compare_regions,
+                        brands_json=current_brands_json
                     )
                 elif task_name == 'kewen_daily_report':
                     result = task_func(
