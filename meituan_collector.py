@@ -118,6 +118,13 @@ GET_PLATFORM_ACCOUNT_API_URL = "http://8.146.210.145:3000/api/get_platform_accou
 SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 
 # ============================================================================
+# 门店和商圈数据获取相关API配置
+# ============================================================================
+SHOP_INFO_API_URL = "https://e.dianping.com/gateway/merchant/general/shopinfo"  # 获取门店列表API
+COMPLEX_FILTER_API_URL = "https://e.dianping.com/gateway/adviser/complexfilter"  # 获取商圈数据API
+STORES_REGIONS_UPLOAD_API_URL = "https://kewenai.asia/api/platform-accounts"  # 门店商圈数据上传API
+
+# ============================================================================
 # 报表模板相关API配置
 # ============================================================================
 TEMPLATE_LIST_API = "https://e.dianping.com/gateway/adviser/report/template/list"
@@ -1213,6 +1220,340 @@ def get_shop_ids(shop_info) -> List[int]:
     return shop_ids if shop_ids else [0]
 
 
+# ============================================================================
+# 门店和商圈数据获取与上传函数
+# ============================================================================
+
+def fetch_shop_list(cookies: Dict[str, Any]) -> Tuple[List[Dict], List[Dict]]:
+    """获取门店列表
+
+    调用大众点评API获取门店数据，返回两种格式：
+    1. 完整格式（用于后续获取商圈数据）
+    2. 上传格式（与插件 stores_json 格式一致）
+
+    Args:
+        cookies: 登录凭证
+
+    Returns:
+        Tuple[List[Dict], List[Dict]]: (完整门店列表, 上传格式门店列表)
+    """
+    print(f"\n{'─' * 50}")
+    print(f"📋 获取门店列表...")
+
+    url = SHOP_INFO_API_URL
+    params = {
+        'yodaReady': 'h5',
+        'csecplatform': '4',
+        'csecversion': '4.1.1'
+    }
+
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://e.dianping.com/'
+    }
+
+    body = {
+        "bizType": "pc-shouye",
+        "device": "pc",
+        "currentTab": "city",
+        "shopIds": "0"
+    }
+
+    proxies = {'http': None, 'https': None}
+
+    try:
+        response = requests.post(
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            json=body,
+            proxies=proxies,
+            timeout=30
+        )
+
+        result = response.json()
+        full_shop_list = []
+        upload_shop_list = []
+
+        if result.get('code') == 200 and result.get('data', {}).get('shopInfoList'):
+            for shop in result['data']['shopInfoList']:
+                if shop.get('type') != 0:  # 过滤type=0的"全部门店"
+                    # 完整信息（供商圈查询使用）
+                    full_shop_list.append({
+                        'shop_id': str(shop['shopId']),
+                        'shop_name': shop['shopName'] + (shop.get('branchName') or ''),
+                        'shopName': shop['shopName'],
+                        'branchName': shop.get('branchName') or None,
+                        'cityId': shop.get('cityId')
+                    })
+                    # 上传格式（与插件 stores_json 一致）
+                    upload_shop_list.append({
+                        'shop_id': str(shop['shopId']),
+                        'shop_name': shop['shopName'] + (shop.get('branchName') or '')
+                    })
+
+            print(f"   ✅ 获取成功，共 {len(full_shop_list)} 个门店")
+        else:
+            print(f"   ⚠️ 未获取到门店数据: {result.get('msg', '未知错误')}")
+
+        return full_shop_list, upload_shop_list
+
+    except Exception as e:
+        print(f"   ❌ 获取门店列表失败: {str(e)}")
+        return [], []
+
+
+def fetch_shop_regions(cookies: Dict[str, Any], mtgsig: str, shop_id: str) -> Dict:
+    """获取单个门店的商圈数据
+
+    Args:
+        cookies: 登录凭证
+        mtgsig: 签名信息
+        shop_id: 门店ID
+
+    Returns:
+        dict: 商圈数据（原始返回）
+    """
+    url = COMPLEX_FILTER_API_URL
+    params = {
+        'device': 'pc',
+        'source': '1',
+        'pageType': 'compareRegions',
+        'sign': '',
+        'shopIds': shop_id,
+        'yodaReady': 'h5',
+        'csecplatform': '4',
+        'csecversion': '4.1.1',
+        'mtgsig': mtgsig
+    }
+
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://e.dianping.com/codejoy/2703/home/index.html'
+    }
+
+    proxies = {'http': None, 'https': None}
+
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            proxies=proxies,
+            timeout=30
+        )
+        return response.json()
+    except Exception as e:
+        return {'success': False, 'msg': str(e)}
+
+
+def fetch_all_shops_regions(cookies: Dict[str, Any], mtgsig: str, shop_list: List[Dict]) -> Dict[str, Dict]:
+    """获取所有门店的商圈数据
+
+    返回格式与插件 compareRegions_json 完全一致
+
+    Args:
+        cookies: 登录凭证
+        mtgsig: 签名信息
+        shop_list: 完整门店列表
+
+    Returns:
+        dict: 商圈数据字典，key为shop_id
+    """
+    print(f"\n{'─' * 50}")
+    print(f"📋 获取商圈数据...")
+
+    if not shop_list:
+        print("   ⚠️ 门店列表为空")
+        return {}
+
+    if not mtgsig:
+        print("   ⚠️ 缺少mtgsig，无法获取商圈数据")
+        return {}
+
+    compare_regions_data = {}
+
+    for i, shop in enumerate(shop_list):
+        shop_id = shop['shop_id']
+        shop_name = shop.get('shopName', shop.get('shop_name', ''))
+        print(f"   [{i + 1}/{len(shop_list)}] 正在获取门店 {shop_name} (ID: {shop_id}) 的商圈数据...")
+
+        result = fetch_shop_regions(cookies, mtgsig, shop_id)
+
+        if result.get('success') and result.get('data', {}).get('compareRegions'):
+            regions_list = result['data']['compareRegions'].get('content', [])
+
+            # 转换为插件格式
+            regions_dict = {}
+            for region in regions_list:
+                region_type = region.get('type')
+                if region_type == '城市':
+                    regions_dict['city'] = {
+                        'regionId': region['regionId'],
+                        'regionName': region['regionName']
+                    }
+                elif region_type == '行政区':
+                    regions_dict['district'] = {
+                        'regionId': region['regionId'],
+                        'regionName': region['regionName']
+                    }
+                elif region_type == '商圈':
+                    regions_dict['business'] = {
+                        'regionId': region['regionId'],
+                        'regionName': region['regionName']
+                    }
+
+            # 与插件格式完全一致
+            compare_regions_data[shop_id] = {
+                'shopName': shop.get('shopName', ''),
+                'branchName': shop.get('branchName'),
+                'cityId': shop.get('cityId'),
+                'regions': regions_dict
+            }
+
+            print(f"      ✅ 成功: {regions_dict}")
+        else:
+            print(f"      ❌ 失败: {result.get('msg', '未知错误')}")
+
+    print(f"   📊 成功获取 {len(compare_regions_data)}/{len(shop_list)} 个门店的商圈数据")
+    return compare_regions_data
+
+
+def upload_stores_and_regions(account: str, stores_json: List[Dict], compare_regions_json: Dict) -> bool:
+    """上传门店和商圈数据到后端
+
+    调用 https://kewenai.asia/api/platform-accounts 上传数据
+
+    Args:
+        account: 账户名称
+        stores_json: 门店数据列表
+        compare_regions_json: 商圈数据字典
+
+    Returns:
+        bool: 上传是否成功
+    """
+    print(f"\n{'─' * 50}")
+    print(f"📤 上传门店和商圈数据...")
+    print(f"   URL: {STORES_REGIONS_UPLOAD_API_URL}")
+    print(f"   账户: {account}")
+    print(f"   门店数量: {len(stores_json)}")
+    print(f"   商圈数量: {len(compare_regions_json)}")
+
+    headers = {'Content-Type': 'application/json'}
+    json_param = {
+        "account": account,
+        "stores_json": stores_json,
+        "compareRegions_json": compare_regions_json
+    }
+    proxies = {'http': None, 'https': None}
+
+    try:
+        response = requests.post(
+            STORES_REGIONS_UPLOAD_API_URL,
+            headers=headers,
+            data=json.dumps(json_param, ensure_ascii=False),
+            proxies=proxies,
+            timeout=30
+        )
+
+        print(f"   HTTP状态码: {response.status_code}")
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success') or result.get('code') == 200:
+                print(f"   ✅ 上传成功")
+                return True
+            else:
+                print(f"   ❌ 上传失败: {result.get('message', result.get('msg', '未知错误'))}")
+                return False
+        else:
+            print(f"   ❌ 上传失败，HTTP状态码: {response.status_code}")
+            return False
+
+    except Exception as e:
+        print(f"   ❌ 上传异常: {str(e)}")
+        return False
+
+
+def check_and_fetch_stores_regions(account: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """检查并获取门店和商圈数据
+
+    当 stores_json 或 compareRegions_json 为空时，主动获取并上传
+
+    Args:
+        account: 账户名称
+        data: 从 /api/get_platform_account 获取的账户数据
+
+    Returns:
+        dict: 更新后的数据（包含 stores_json 和 compareRegions_json）
+    """
+    stores_json = data.get('stores_json')
+    compare_regions_json = data.get('compareRegions_json')
+    cookies = data.get('cookie', {})
+    mtgsig_data = data.get('mtgsig')
+
+    # 检查是否为空
+    stores_empty = not stores_json or stores_json == {} or stores_json == [] or stores_json is None
+    regions_empty = not compare_regions_json or compare_regions_json == {} or compare_regions_json == [] or compare_regions_json is None
+
+    if not stores_empty and not regions_empty:
+        print(f"\n   ✅ stores_json 和 compareRegions_json 数据完整，无需获取")
+        return data
+
+    print(f"\n{'=' * 60}")
+    print(f"⚠️ 检测到门店/商圈数据缺失，开始自动获取...")
+    print(f"   stores_json 为空: {stores_empty}")
+    print(f"   compareRegions_json 为空: {regions_empty}")
+    print(f"{'=' * 60}")
+
+    # 检查 cookies 是否可用
+    if not cookies:
+        print(f"   ❌ 无法获取数据：cookies 为空")
+        return data
+
+    # 准备 mtgsig
+    mtgsig = None
+    if mtgsig_data:
+        mtgsig = mtgsig_data if isinstance(mtgsig_data, str) else json.dumps(mtgsig_data)
+
+    # 获取门店列表
+    full_shop_list, upload_shop_list = fetch_shop_list(cookies)
+
+    if not full_shop_list:
+        print(f"   ❌ 获取门店列表失败，无法继续")
+        return data
+
+    # 获取商圈数据
+    compare_regions_data = {}
+    if mtgsig:
+        compare_regions_data = fetch_all_shops_regions(cookies, mtgsig, full_shop_list)
+    else:
+        print(f"   ⚠️ 缺少 mtgsig，跳过商圈数据获取")
+
+    # 上传数据
+    if upload_shop_list or compare_regions_data:
+        upload_success = upload_stores_and_regions(account, upload_shop_list, compare_regions_data)
+        if upload_success:
+            # 更新本地数据
+            data['stores_json'] = upload_shop_list
+            data['compareRegions_json'] = compare_regions_data
+            print(f"\n   ✅ 数据获取并上传完成，已更新本地数据")
+        else:
+            print(f"\n   ⚠️ 数据上传失败，但本地数据已更新")
+            data['stores_json'] = upload_shop_list
+            data['compareRegions_json'] = compare_regions_data
+    else:
+        print(f"\n   ⚠️ 未获取到任何数据")
+
+    return data
+
+
 def get_platform_account(account: str) -> Dict[str, Any]:
     """获取平台账户信息
 
@@ -1260,11 +1601,20 @@ def get_platform_account(account: str) -> Dict[str, Any]:
                 templates_id = data.get('templates_id')
                 auth_status = data.get('auth_status')
                 stores_json = data.get('stores_json', [])
+                compare_regions_json = data.get('compareRegions_json', {})
 
                 print(f"   ✅ 获取成功")
                 print(f"   templates_id: {templates_id}")
                 print(f"   auth_status: {auth_status}")
                 print(f"   门店数量: {len(stores_json) if stores_json else 0}")
+                print(f"   商圈数量: {len(compare_regions_json) if compare_regions_json else 0}")
+
+                # 检查并获取缺失的门店和商圈数据
+                data = check_and_fetch_stores_regions(account, data)
+
+                # 更新变量（可能已被 check_and_fetch_stores_regions 更新）
+                stores_json = data.get('stores_json', [])
+                compare_regions_json = data.get('compareRegions_json', {})
 
                 return {
                     'success': True,
@@ -1273,7 +1623,8 @@ def get_platform_account(account: str) -> Dict[str, Any]:
                     'auth_status': auth_status,
                     'cookie': data.get('cookie'),
                     'mtgsig': data.get('mtgsig'),
-                    'stores_json': stores_json
+                    'stores_json': stores_json,
+                    'compareRegions_json': compare_regions_json
                 }
             else:
                 error_msg = result.get('message', '获取账户信息失败')
