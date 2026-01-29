@@ -115,6 +115,7 @@ TASK_CALLBACK_API_URL = "http://8.146.210.145:3000/api/task/callback"  # 任务�
 RESCHEDULE_FAILED_API_URL = "http://8.146.210.145:3000/api/task/reschedule-failed"  # 失败任务重新调度API
 TASK_RESET_API_URL = "http://8.146.210.145:3000/api/task/schedule/reset"  # 任务重置API（资源不足时归还任务）
 GET_PLATFORM_ACCOUNT_API_URL = "http://8.146.210.145:3000/api/get_platform_account"  # 获取平台账户信息API
+POST_STORES_REGIONS_API_URL = "http://8.146.210.145:3000/api/post/platform_accounts"  # 门店/商圈数据回传API
 SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 
 # ============================================================================
@@ -2642,6 +2643,30 @@ def run_review_detail_dianping(account_name: str, start_date: str, end_date: str
         def safe_str(val, default=''):
             return str(val) if val is not None else default
 
+        def get_review_shop_id(review):
+            """
+            获取正确的 shop_id
+            优先级: shopIdStr > shopIdLong > shopId
+            API的shopId字段在ID超过int32范围时会溢出为0
+            """
+            # 1. 优先使用 shopIdStr（字符串，最安全）
+            shop_id_str = review.get('shopIdStr')
+            if shop_id_str and str(shop_id_str) != '0':
+                return str(shop_id_str)
+
+            # 2. 其次使用 shopIdLong（长整型）
+            shop_id_long = review.get('shopIdLong')
+            if shop_id_long and shop_id_long != 0:
+                return str(shop_id_long)
+
+            # 3. 最后使用 shopId（可能溢出为0）
+            shop_id = review.get('shopId')
+            if shop_id and shop_id != 0:
+                return str(shop_id)
+
+            # 4. 都没有，返回 "0"
+            return "0"
+
         all_reviews = []
         upload_stats = {"success": 0, "failed": 0}
         shop_ids_found = set()
@@ -2687,9 +2712,14 @@ def run_review_detail_dianping(account_name: str, start_date: str, end_date: str
                 break
 
             for review in reviews:
-                shop_id = safe_int(review.get('shopId'), 0)
-                if shop_id:
-                    shop_ids_found.add(shop_id)
+                # 获取正确的 shop_id（字符串格式，处理大整数溢出问题）
+                # 优先级: shopIdStr > shopIdLong > shopId
+                shop_id = get_review_shop_id(review)
+                if shop_id and shop_id != "0":
+                    try:
+                        shop_ids_found.add(int(shop_id))
+                    except ValueError:
+                        pass
 
                 # 映射数据
                 star_raw = safe_int(review.get('star'), 0)
@@ -2894,6 +2924,30 @@ def run_review_detail_meituan(account_name: str, start_date: str, end_date: str,
                     return safe_str(item.get('content'), default)
             return default
 
+        def get_review_shop_id(review):
+            """
+            获取正确的 shop_id
+            优先级: shopIdStr > shopIdLong > shopId
+            API的shopId字段在ID超过int32范围时会溢出为0
+            """
+            # 1. 优先使用 shopIdStr（字符串，最安全）
+            shop_id_str = review.get('shopIdStr')
+            if shop_id_str and str(shop_id_str) != '0':
+                return str(shop_id_str)
+
+            # 2. 其次使用 shopIdLong（长整型）
+            shop_id_long = review.get('shopIdLong')
+            if shop_id_long and shop_id_long != 0:
+                return str(shop_id_long)
+
+            # 3. 最后使用 shopId（可能溢出为0）
+            shop_id = review.get('shopId')
+            if shop_id and shop_id != 0:
+                return str(shop_id)
+
+            # 4. 都没有，返回 "0"
+            return "0"
+
         all_reviews = []
         upload_stats = {"success": 0, "failed": 0}
         shop_ids_found = set()
@@ -2939,9 +2993,14 @@ def run_review_detail_meituan(account_name: str, start_date: str, end_date: str,
                 break
 
             for review in reviews:
-                shop_id = safe_int(review.get('shopId'), 0)
-                if shop_id:
-                    shop_ids_found.add(shop_id)
+                # 获取正确的 shop_id（字符串格式，处理大整数溢出问题）
+                # 优先级: shopIdStr > shopIdLong > shopId
+                shop_id = get_review_shop_id(review)
+                if shop_id and shop_id != "0":
+                    try:
+                        shop_ids_found.add(int(shop_id))
+                    except ValueError:
+                        pass
 
                 star_raw = safe_int(review.get('star'), 0)
                 add_time = timestamp_to_datetime(review.get('addTime'))
@@ -3697,6 +3756,9 @@ class DianpingStoreStats:
                 if not self.shop_id and self.shop_list:
                     self.shop_id = self.shop_list[0].get('shop_id')
 
+                # 检测并补全门店/商圈数据（任一为空则触发）
+                self._check_and_complete_stores_regions()
+
                 return
 
             # 没有外部数据，从API获取完整信息
@@ -3762,6 +3824,9 @@ class DianpingStoreStats:
             if not self.shop_id and stores_json:
                 self.shop_id = stores_json[0].get('shop_id')
 
+            # 检测并补全门店/商圈数据（任一为空则触发）
+            self._check_and_complete_stores_regions()
+
         except Exception as e:
             print(f"❌ 加载账户信息失败: {e}")
             raise
@@ -3808,6 +3873,263 @@ class DianpingStoreStats:
 
         except Exception as e:
             print(f"⚠️ 补充获取信息失败: {e}")
+
+    def _fetch_shop_list_from_dianping(self) -> list:
+        """
+        从大众点评API获取门店列表
+        API: POST https://e.dianping.com/gateway/merchant/general/shopinfo
+        返回: stores_json 格式的门店列表
+        """
+        try:
+            print(f"\n📡 正在从大众点评获取门店列表...")
+            url = "https://e.dianping.com/gateway/merchant/general/shopinfo"
+            params = {
+                'yodaReady': 'h5',
+                'csecplatform': '4',
+                'csecversion': '4.1.1'
+            }
+            payload = {
+                "bizType": "pc-shouye",
+                "device": "pc",
+                "currentTab": "city",
+                "shopIds": "0"
+            }
+            headers = {
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Connection': 'keep-alive',
+                'Content-Type': 'application/json',
+                'Referer': 'https://e.dianping.com/codejoy/2703/home/index.html',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+
+            session = self._get_session()
+            response = session.post(
+                url,
+                params=params,
+                headers=headers,
+                cookies=self.cookies,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get('code') == 200 and data.get('data') and data['data'].get('shopInfoList'):
+                shop_list = []
+                for shop in data['data']['shopInfoList']:
+                    if shop.get('type') != 0:  # 过滤 type=0 的
+                        shop_name = shop.get('shopName', '')
+                        branch_name = shop.get('branchName') or ''
+                        full_name = shop_name + branch_name
+                        shop_list.append({
+                            'shop_id': str(shop.get('shopId', '')),
+                            'shop_name': full_name,
+                            'shopName': shop_name,
+                            'branchName': branch_name if branch_name else None,
+                            'cityId': shop.get('cityId') or None
+                        })
+                print(f"✅ 成功获取 {len(shop_list)} 个门店")
+                return shop_list
+            else:
+                print(f"⚠️ 门店列表返回数据格式错误: {data}")
+                return []
+
+        except Exception as e:
+            print(f"⚠️ 获取门店列表失败: {e}")
+            return []
+
+    def _fetch_shop_regions_from_dianping(self, shop_list: list) -> dict:
+        """
+        从大众点评API获取所有门店的商圈数据
+        API: GET https://e.dianping.com/gateway/adviser/complexfilter
+        返回: compareRegions_json 格式的商圈数据
+        """
+        if not shop_list:
+            return {}
+
+        print(f"\n📡 开始获取 {len(shop_list)} 个门店的商圈数据...")
+        compare_regions_data = {}
+
+        for i, shop in enumerate(shop_list):
+            shop_id = shop['shop_id']
+            shop_name = shop.get('shopName', shop.get('shop_name', ''))
+
+            print(f"   [{i + 1}/{len(shop_list)}] 正在获取门店 {shop_name} (ID: {shop_id}) 的商圈数据...")
+
+            try:
+                url = "https://e.dianping.com/gateway/adviser/complexfilter"
+                params = {
+                    'device': 'pc',
+                    'source': '1',
+                    'pageType': 'compareRegions',
+                    'sign': '',
+                    'shopIds': shop_id,
+                    'yodaReady': 'h5',
+                    'csecplatform': '4',
+                    'csecversion': '4.1.1',
+                    'mtgsig': self._generate_mtgsig() if hasattr(self, '_generate_mtgsig') else ''
+                }
+                headers = {
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    'Connection': 'keep-alive',
+                    'Referer': 'https://e.dianping.com/codejoy/2703/home/index.html',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+
+                session = self._get_session()
+                response = session.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    cookies=self.cookies,
+                    timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if data.get('success') and data.get('data') and data['data'].get('compareRegions'):
+                    regions = data['data']['compareRegions'].get('content', [])
+
+                    # 解析商圈数据
+                    regions_dict = {}
+                    for region in regions:
+                        region_type = region.get('type', '')
+                        if region_type == '城市':
+                            regions_dict['city'] = {
+                                'regionId': region.get('regionId'),
+                                'regionName': region.get('regionName')
+                            }
+                        elif region_type == '行政区':
+                            regions_dict['district'] = {
+                                'regionId': region.get('regionId'),
+                                'regionName': region.get('regionName')
+                            }
+                        elif region_type == '商圈':
+                            regions_dict['business'] = {
+                                'regionId': region.get('regionId'),
+                                'regionName': region.get('regionName')
+                            }
+
+                    compare_regions_data[shop_id] = {
+                        'shopName': shop.get('shopName', ''),
+                        'branchName': shop.get('branchName'),
+                        'cityId': shop.get('cityId'),
+                        'regions': regions_dict
+                    }
+                    print(f"      ✅ 成功: {regions_dict}")
+                else:
+                    print(f"      ⚠️ 失败: {data.get('msg', '返回数据格式错误')}")
+
+            except Exception as e:
+                print(f"      ⚠️ 失败: {e}")
+
+            # 间隔延迟，避免请求过快
+            if i < len(shop_list) - 1:
+                time.sleep(2)
+
+        print(f"\n✅ 商圈数据获取完成，成功 {len(compare_regions_data)}/{len(shop_list)} 个")
+        return compare_regions_data
+
+    def _post_stores_regions_to_api(self, stores_json: list, compare_regions_json: dict) -> bool:
+        """
+        回传门店和商圈数据到后端API
+        API: POST http://8.146.210.145:3000/api/post/platform_accounts
+        """
+        try:
+            print(f"\n📤 正在回传门店和商圈数据...")
+
+            payload = {
+                "account": self.account_name,
+                "stores_json": json.dumps(stores_json, ensure_ascii=False),
+                "compareRegions_json": json.dumps(compare_regions_json, ensure_ascii=False)
+            }
+
+            session = self._get_session()
+            response = session.post(
+                POST_STORES_REGIONS_API_URL,
+                headers={'Content-Type': 'application/json'},
+                json=payload,
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    print(f"✅ 门店和商圈数据回传成功")
+                    return True
+                else:
+                    print(f"⚠️ 回传返回失败: {result}")
+                    return False
+            else:
+                print(f"⚠️ 回传HTTP状态码异常: {response.status_code}")
+                return False
+
+        except Exception as e:
+            print(f"⚠️ 回传门店和商圈数据失败: {e}")
+            return False
+
+    def _check_and_complete_stores_regions(self):
+        """
+        检测并补全门店/商圈数据
+        触发条件: stores_json 为空 OR compareRegions_json 为空
+        此任务失败不影响主流程，不记录失败日志
+        """
+        try:
+            # 检查是否需要补全
+            stores_empty = not self.shop_list or len(self.shop_list) == 0
+            regions_empty = not self.shop_region_info or len(self.shop_region_info) == 0
+
+            if not stores_empty and not regions_empty:
+                # 数据完整，无需补全
+                return
+
+            print(f"\n🔄 检测到门店/商圈数据不完整，开始自动补全...")
+            print(f"   门店数据: {'为空' if stores_empty else f'{len(self.shop_list)} 个'}")
+            print(f"   商圈数据: {'为空' if regions_empty else f'{len(self.shop_region_info)} 个'}")
+
+            # 如果门店数据为空，先获取门店列表
+            if stores_empty:
+                fetched_shops = self._fetch_shop_list_from_dianping()
+                if fetched_shops:
+                    # 转换为 stores_json 格式
+                    self.shop_list = [{'shop_id': s['shop_id'], 'shop_name': s['shop_name']} for s in fetched_shops]
+                    stores_empty = False
+                else:
+                    print(f"⚠️ 无法获取门店列表，跳过补全")
+                    return
+            else:
+                # 门店数据不为空，用于获取商圈
+                fetched_shops = []
+                for shop in self.shop_list:
+                    fetched_shops.append({
+                        'shop_id': shop.get('shop_id', ''),
+                        'shop_name': shop.get('shop_name', ''),
+                        'shopName': shop.get('shop_name', '').split('店')[0] if '店' in shop.get('shop_name', '') else shop.get('shop_name', ''),
+                        'branchName': None,
+                        'cityId': None
+                    })
+
+            # 获取商圈数据
+            if regions_empty and fetched_shops:
+                fetched_regions = self._fetch_shop_regions_from_dianping(fetched_shops)
+                if fetched_regions:
+                    self.shop_region_info = fetched_regions
+
+            # 准备回传数据
+            stores_to_post = self.shop_list if self.shop_list else []
+            regions_to_post = self.shop_region_info if self.shop_region_info else {}
+
+            # 回传数据
+            if stores_to_post or regions_to_post:
+                self._post_stores_regions_to_api(stores_to_post, regions_to_post)
+
+            print(f"✅ 门店/商圈数据补全完成")
+
+        except Exception as e:
+            # 补全失败不影响主流程，静默处理
+            print(f"⚠️ 门店/商圈数据补全失败（不影响主任务）: {e}")
 
     def _install_browser(self):
         """自动安装Playwright浏览器"""
