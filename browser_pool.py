@@ -33,6 +33,14 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     print("⚠️ 未安装playwright，浏览器池功能将不可用")
 
+# 评价回复模块导入
+try:
+    from review_reply import process_review_replies
+    REVIEW_REPLY_AVAILABLE = True
+except ImportError:
+    REVIEW_REPLY_AVAILABLE = False
+    print("⚠️ 未安装review_reply模块，评价回复功能将不可用")
+
 
 # ============================================================================
 # 配置参数
@@ -1852,6 +1860,22 @@ class KeepaliveService:
 
             wrapper.update_last_keepalive()
             log_info(f"{account_id} 保活成功")
+
+            # 保活成功后执行评价回复任务
+            if REVIEW_REPLY_AVAILABLE and cookies:
+                try:
+                    # 使用线程异步执行，不阻塞保活流程
+                    reply_thread = threading.Thread(
+                        target=process_review_replies,
+                        args=(account_id, cookies),
+                        name=f"ReviewReply-{account_id}",
+                        daemon=True
+                    )
+                    reply_thread.start()
+                    log_info(f"{account_id} 评价回复任务已启动")
+                except Exception as e:
+                    log_warn(f"{account_id} 启动评价回复任务失败: {e}")
+
             return True
 
         except Exception as e:
