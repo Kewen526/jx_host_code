@@ -59,14 +59,14 @@ KEEPALIVE_BATCH_INTERVAL = 60        # 每批之间的间隔（秒）
 KEEPALIVE_TIMEOUT = 15000            # 保活页面超时（毫秒）：15秒（原30秒）
 KEEPALIVE_FAIL_COOLDOWN = 10 * 60    # 失败冷却时间（秒）：10分钟
 
-# 资源保护配置
+# 资源保护配置（调整后：减少误释放，保证评论回复全天候运行）
 RESOURCE_CHECK_INTERVAL = 30         # 资源检查间隔（秒）
-CPU_WARNING_THRESHOLD = 50           # CPU警告阈值（%）
-CPU_CRITICAL_THRESHOLD = 70          # CPU危险阈值（%）
-MEMORY_WARNING_THRESHOLD = 60        # 内存警告阈值（%）
-MEMORY_CRITICAL_THRESHOLD = 80       # 内存危险阈值（%）
-MAX_ACTIVE_CONTEXTS = 10             # 最大活跃Context数量
-CONTEXT_IDLE_TIMEOUT = 30 * 60       # Context空闲超时（秒）：30分钟
+CPU_WARNING_THRESHOLD = 70           # CPU警告阈值（%）：50→70，减少误触发
+CPU_CRITICAL_THRESHOLD = 85          # CPU危险阈值（%）：70→85
+MEMORY_WARNING_THRESHOLD = 75        # 内存警告阈值（%）：60→75，减少误触发
+MEMORY_CRITICAL_THRESHOLD = 90       # 内存危险阈值（%）：80→90
+MAX_ACTIVE_CONTEXTS = 15             # 最大活跃Context数量：10→15
+CONTEXT_IDLE_TIMEOUT = 4 * 60 * 60   # Context空闲超时（秒）：30分钟→4小时
 
 # 浏览器重启配置
 BROWSER_RESTART_HOUR = 14            # 每天重启时间（14点，任务少的时候）
