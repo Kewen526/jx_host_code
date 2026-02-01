@@ -89,8 +89,15 @@ def get_pending_reply_list(account: str) -> List[Dict]:
 
         result = response.json()
         if result.get('success'):
-            data = result.get('data', [])
-            return data if isinstance(data, list) else []
+            data = result.get('data')
+            # 支持单条数据（对象）和多条数据（数组）两种格式
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict) and data:
+                # API返回单条数据时是对象，包装成数组
+                return [data]
+            else:
+                return []
         else:
             log_warn(f"获取待回复列表失败: {result.get('message', '未知错误')}")
             return []
@@ -278,6 +285,7 @@ def process_review_replies(account: str, cookies: Dict) -> Dict[str, int]:
         # 1. 获取待回复列表
         pending_list = get_pending_reply_list(account)
         if not pending_list:
+            log_info(f"{account} 无待回复评价")
             return stats
 
         stats["total"] = len(pending_list)
