@@ -87,8 +87,7 @@ COOKIE_CONFIG_API = f"{API_BASE_URL}/api/cookie_config"
 PLATFORM_ACCOUNTS_API = f"{API_BASE_URL}/api/platform-accounts"
 GET_TASK_API = f"{API_BASE_URL}/api/get_task"
 ERROR_LOG_API = f"{API_BASE_URL}/api/log"
-GET_ALL_ACCOUNTS_API = f"{API_BASE_URL}/api/get_platform_accounts"  # 获取所有账号列表
-GET_SINGLE_ACCOUNT_API = f"{API_BASE_URL}/api/get_platform_account"  # 获取单个账号信息
+GET_SINGLE_ACCOUNT_API = f"{API_BASE_URL}/api/get_platform_account"  # 获取单个账号Cookie
 
 # 获取公网IP的服务列表（按优先级）
 PUBLIC_IP_SERVICES = [
@@ -637,51 +636,8 @@ cookie_upload_queue = CookieUploadQueue()
 
 
 # ============================================================================
-# 账号信息获取函数（用于恢复时补全账号）
+# 账号信息获取函数（用于恢复时从API获取Cookie）
 # ============================================================================
-
-def fetch_all_account_ids() -> List[str]:
-    """从API获取所有需要保活的账号ID列表
-
-    Returns:
-        账号ID列表，失败返回空列表
-    """
-    try:
-        response = requests.get(
-            GET_ALL_ACCOUNTS_API,
-            timeout=30,
-            proxies={'http': None, 'https': None}
-        )
-
-        if response.status_code != 200:
-            log_warn(f"获取账号列表失败: HTTP {response.status_code}")
-            return []
-
-        result = response.json()
-        if not result.get('success'):
-            log_warn(f"获取账号列表失败: {result.get('message', '未知错误')}")
-            return []
-
-        data = result.get('data', [])
-        if not isinstance(data, list):
-            return []
-
-        # 提取账号ID（字段名可能是 account 或 account_id）
-        account_ids = []
-        for item in data:
-            if isinstance(item, dict):
-                account_id = item.get('account') or item.get('account_id')
-                if account_id:
-                    account_ids.append(str(account_id))
-            elif isinstance(item, str):
-                account_ids.append(item)
-
-        return account_ids
-
-    except Exception as e:
-        log_warn(f"获取账号列表异常: {e}")
-        return []
-
 
 def fetch_account_cookie(account_id: str) -> Optional[Dict]:
     """从API获取单个账号的Cookie
@@ -1011,6 +967,9 @@ class BrowserPoolManager:
 
         # 账号到Context的映射
         self._contexts: Dict[str, ContextWrapper] = {}
+
+        # 【新增】已知账号集合（本服务器管理的所有账号，释放时不删除）
+        self._known_accounts: set = set()
 
         # 线程锁（使用可重入锁，避免 restart_browsers 调用 get_context 时死锁）
         self._lock = threading.RLock()
@@ -1349,6 +1308,9 @@ class BrowserPoolManager:
                     self._contexts[account_id] = wrapper
                     self._browser_context_counts[browser_index] += 1
 
+                    # 【新增】将账号添加到已知账号集合（永久保留）
+                    self._known_accounts.add(account_id)
+
                     log_info(f"为 {account_id} 创建新Context (Browser {browser_index})")
 
                     return wrapper
@@ -1436,13 +1398,22 @@ class BrowserPoolManager:
             return sum(1 for b in self._browsers if b is not None)
 
     def _save_state(self):
-        """保存状态到文件"""
+        """保存状态到文件
+
+        【新方案】保存两部分数据：
+        1. known_accounts: 本服务器管理的所有账号ID（永久保留，释放时不删除）
+        2. contexts: 当前活跃的Context及其Cookie
+        """
         state = {
             'saved_at': datetime.now().isoformat(),
+            'known_accounts': [],  # 【新增】所有已知账号列表
             'contexts': {}
         }
 
         with self._lock:
+            # 【新增】保存所有已知账号
+            state['known_accounts'] = list(self._known_accounts)
+
             for account_id, wrapper in self._contexts.items():
                 # 获取最新Cookie
                 cookies = wrapper.get_cookies()
@@ -1458,77 +1429,78 @@ class BrowserPoolManager:
             os.makedirs(STATE_DIR, exist_ok=True)
             with open(state_file, 'w', encoding='utf-8') as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
-            print(f"   ✅ 状态已保存到 {state_file}")
+            print(f"   ✅ 状态已保存到 {state_file}（{len(state['known_accounts'])} 个账号）")
         except Exception as e:
             print(f"   ⚠️ 保存状态失败: {e}")
 
     def _restore_state(self):
-        """从文件恢复状态，并从API补全缺失的账号
+        """从文件恢复状态
 
-        【方案B】恢复逻辑：
-        1. 从状态文件恢复已保存的账号（优先使用本地Cookie）
-        2. 从API获取所有需要保活的账号列表
-        3. 对于状态文件中没有的账号，从API获取Cookie并恢复
+        【新方案】恢复逻辑：
+        1. 从状态文件读取 known_accounts（本服务器管理的所有账号）
+        2. 从状态文件的 contexts 恢复有本地Cookie的账号
+        3. 对于没有本地Cookie的账号，从API获取Cookie并恢复
+
+        注意：不再调用 fetch_all_account_ids()，因为该API不存在
         """
         state_file = os.path.join(STATE_DIR, BROWSER_POOL_STATE_FILE)
         restored_accounts = set()  # 记录已恢复的账号
 
-        # ========== 步骤1：从状态文件恢复 ==========
+        # ========== 步骤1：读取状态文件 ==========
+        known_accounts = []
         contexts_data = {}
         if os.path.exists(state_file):
             try:
                 with open(state_file, 'r', encoding='utf-8') as f:
                     state = json.load(f)
+                # 【新增】读取已知账号列表
+                known_accounts = state.get('known_accounts', [])
                 contexts_data = state.get('contexts', {})
+                print(f"   📂 状态文件: {len(known_accounts)} 个已知账号，{len(contexts_data)} 个有Cookie")
             except Exception as e:
                 print(f"   ⚠️ 读取状态文件失败: {e}")
 
-        if contexts_data:
-            print(f"   📂 发现 {len(contexts_data)} 个账号的历史状态，正在恢复...")
+        # 【新增】恢复已知账号集合
+        with self._lock:
+            self._known_accounts = set(known_accounts)
 
-            restored = 0
-            for account_id, data in contexts_data.items():
+        if not known_accounts:
+            print("   📝 无历史账号记录")
+            return
+
+        # ========== 步骤2：从本地Cookie恢复 ==========
+        local_restored = 0
+        for account_id in known_accounts:
+            if account_id in contexts_data:
                 try:
-                    cookies = data.get('cookies', {})
+                    cookies = contexts_data[account_id].get('cookies', {})
                     if cookies:
                         self.get_context(account_id, cookies)
                         restored_accounts.add(account_id)
-                        restored += 1
+                        local_restored += 1
                 except Exception as e:
-                    print(f"   ⚠️ 从状态文件恢复 {account_id} 失败: {e}")
+                    print(f"   ⚠️ 从本地恢复 {account_id} 失败: {e}")
 
-            print(f"   ✅ 从状态文件恢复 {restored} 个账号")
-        else:
-            print("   📝 无历史状态或状态为空")
+        print(f"   ✅ 从本地Cookie恢复 {local_restored} 个账号")
 
-        # ========== 步骤2：从API获取所有账号列表并补全 ==========
-        print("   🔄 从API获取所有账号列表，补全缺失账号...")
-        all_accounts = fetch_all_account_ids()
-
-        if not all_accounts:
-            print("   ⚠️ 未能从API获取账号列表，跳过补全")
-            return
-
-        print(f"   📋 API返回 {len(all_accounts)} 个账号")
-
-        # 找出需要补全的账号（在API列表中但不在已恢复列表中）
-        missing_accounts = [acc for acc in all_accounts if acc not in restored_accounts]
+        # ========== 步骤3：从API补全没有本地Cookie的账号 ==========
+        missing_accounts = [acc for acc in known_accounts if acc not in restored_accounts]
 
         if not missing_accounts:
-            print("   ✅ 所有账号已恢复，无需补全")
+            print("   ✅ 所有账号已恢复，无需从API补全")
             return
 
-        print(f"   🔍 需要从API补全 {len(missing_accounts)} 个账号...")
+        print(f"   🔄 从API补全 {len(missing_accounts)} 个缺失账号的Cookie...")
 
-        # ========== 步骤3：从API获取缺失账号的Cookie并恢复 ==========
         api_restored = 0
         api_failed = 0
         for account_id in missing_accounts:
             try:
-                # 从API获取Cookie
+                # 从API获取Cookie（POST /api/get_platform_account）
                 cookies = fetch_account_cookie(account_id)
                 if cookies:
                     self.get_context(account_id, cookies)
+                    restored_accounts.add(account_id)
                     api_restored += 1
                     print(f"   ✅ 从API补全: {account_id}")
                 else:
@@ -1539,12 +1511,12 @@ class BrowserPoolManager:
                 print(f"   ⚠️ 从API恢复 {account_id} 失败: {e}")
 
         print(f"   ✅ 从API补全完成: 成功 {api_restored} 个，失败 {api_failed} 个")
-        print(f"   📊 总计恢复: {len(restored_accounts) + api_restored} 个账号")
+        print(f"   📊 总计恢复: {len(restored_accounts)} 个账号")
 
     def restart_browsers(self):
         """重启所有Browser（用于释放内存）
 
-        【方案B增强】重启后从API补全缺失的账号
+        【新方案】使用 _known_accounts 恢复，不依赖 fetch_all_account_ids()
         """
         print("\n🔄 开始重启浏览器...")
 
@@ -1553,6 +1525,9 @@ class BrowserPoolManager:
             saved_cookies = {}
             for account_id, wrapper in self._contexts.items():
                 saved_cookies[account_id] = wrapper.get_cookies()
+
+            # 【重要】保存已知账号列表（重启后需要恢复）
+            all_known_accounts = list(self._known_accounts)
 
             # 关闭所有Context
             for wrapper in self._contexts.values():
@@ -1574,44 +1549,41 @@ class BrowserPoolManager:
 
             print("   ✅ 所有Browser已关闭")
 
-            # 步骤1：恢复之前保存的Context
+            # 步骤1：从内存保存的Cookie恢复
             restored = 0
             restored_accounts = set()
             for account_id, cookies in saved_cookies.items():
                 try:
-                    self.get_context(account_id, cookies)
-                    restored += 1
-                    restored_accounts.add(account_id)
+                    if cookies:
+                        self.get_context(account_id, cookies)
+                        restored += 1
+                        restored_accounts.add(account_id)
                 except Exception as e:
                     print(f"   ⚠️ 恢复 {account_id} 失败: {e}")
 
             print(f"   ✅ 从内存恢复 {restored} 个账号")
 
         # 步骤2：从API补全缺失的账号（在锁外执行，避免长时间持锁）
-        print("   🔄 从API补全缺失账号...")
-        all_accounts = fetch_all_account_ids()
+        # 【新方案】使用 _known_accounts 而不是调用不存在的API
+        missing_accounts = [acc for acc in all_known_accounts if acc not in restored_accounts]
 
-        if all_accounts:
-            missing_accounts = [acc for acc in all_accounts if acc not in restored_accounts]
+        if missing_accounts:
+            print(f"   🔄 从API补全 {len(missing_accounts)} 个缺失账号的Cookie...")
+            api_restored = 0
+            for account_id in missing_accounts:
+                try:
+                    cookies = fetch_account_cookie(account_id)
+                    if cookies:
+                        self.get_context(account_id, cookies)
+                        api_restored += 1
+                        print(f"   ✅ 从API补全: {account_id}")
+                except Exception as e:
+                    print(f"   ⚠️ 从API恢复 {account_id} 失败: {e}")
 
-            if missing_accounts:
-                print(f"   🔍 需要从API补全 {len(missing_accounts)} 个账号...")
-                api_restored = 0
-                for account_id in missing_accounts:
-                    try:
-                        cookies = fetch_account_cookie(account_id)
-                        if cookies:
-                            self.get_context(account_id, cookies)
-                            api_restored += 1
-                    except Exception as e:
-                        print(f"   ⚠️ 从API恢复 {account_id} 失败: {e}")
-
-                print(f"   ✅ 从API补全 {api_restored} 个账号")
-                restored += api_restored
-            else:
-                print("   ✅ 所有账号已恢复，无需补全")
+            print(f"   ✅ 从API补全 {api_restored} 个账号")
+            restored += api_restored
         else:
-            print("   ⚠️ 未能从API获取账号列表，跳过补全")
+            print("   ✅ 所有账号已恢复，无需补全")
 
         print(f"   ✅ 浏览器重启完成，共恢复 {restored} 个账号")
 
