@@ -1162,7 +1162,8 @@ def load_cookies_from_api(account_name: str) -> Dict[str, Any]:
             mtgsig = None
 
         # 解析shop_info（字段名: stores_json）
-        shop_info = record.get('stores_json', [])
+        # 使用 or [] 确保 null/None 也能正确转为空列表（dict.get默认值仅在key不存在时生效）
+        shop_info = record.get('stores_json') or []
 
         # 获取templates_id
         templates_id = record.get('templates_id')
@@ -3797,15 +3798,22 @@ class DianpingStoreStats:
                     self.mtgsig_from_api = json.dumps(mtgsig_data)
                 print(f"   已获取mtgsig: {self.mtgsig_from_api[:50]}...")
 
-            # 获取门店列表
-            stores_json = data.get('stores_json', [])
+            # 获取门店列表（使用 or [] 确保 null/None 也能正确转为空列表）
+            stores_json = data.get('stores_json') or []
             if stores_json:
                 self.shop_list = stores_json
                 print(f"✅ 成功加载 {len(self.shop_list)} 个门店")
                 for shop in self.shop_list:
                     print(f"   - {shop.get('shop_name')} ({shop.get('shop_id')})")
             else:
-                raise Exception("未获取到门店列表")
+                # API未返回门店列表，尝试从大众点评直接获取（兜底）
+                print(f"⚠️ API未返回门店列表，尝试从大众点评直接获取...")
+                fetched_shops = self._fetch_shop_list_from_dianping()
+                if fetched_shops:
+                    self.shop_list = [{'shop_id': s['shop_id'], 'shop_name': s['shop_name']} for s in fetched_shops]
+                    print(f"✅ 兜底成功，加载 {len(self.shop_list)} 个门店")
+                else:
+                    raise Exception("未获取到门店列表")
 
             # 获取团购ID映射
             brands_json = data.get('brands_json', [])
