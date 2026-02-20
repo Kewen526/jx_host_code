@@ -4184,6 +4184,11 @@ class DianpingStoreStats:
                     wait_until='domcontentloaded',
                     timeout=LOGIN_CHECK_TIMEOUT
                 )
+                # 等待页面跳转完全稳定，避免 evaluate 时上下文被销毁
+                try:
+                    self.page.wait_for_load_state('networkidle', timeout=5000)
+                except Exception:
+                    pass
                 time.sleep(2)
 
                 current_url = self.page.url
@@ -4201,16 +4206,19 @@ class DianpingStoreStats:
             except Exception as e:
                 error_str = str(e).lower()
                 is_timeout = 'timeout' in error_str
+                is_navigation = 'execution context was destroyed' in error_str or \
+                                'most likely because of a navigation' in error_str
 
-                if is_timeout:
+                if is_timeout or is_navigation:
                     if attempt < max_retries:
                         delay = calculate_retry_delay(attempt)
-                        logger.warning(f"登录检测超时，第 {attempt}/{max_retries} 次尝试，"
+                        reason = "超时" if is_timeout else "页面跳转导致上下文销毁"
+                        logger.warning(f"登录检测{reason}，第 {attempt}/{max_retries} 次尝试，"
                                        f"{delay:.1f} 秒后重试...")
                         time.sleep(delay)
                         continue
                     else:
-                        logger.error(f"登录检测超时，已重试 {max_retries} 次: {e}")
+                        logger.error(f"登录检测失败，已重试 {max_retries} 次: {e}")
                         return False, "timeout"
                 else:
                     logger.error(f"登录检测失败: {e}")
@@ -5170,6 +5178,11 @@ class PageDrivenTaskExecutor:
                     wait_until='domcontentloaded',
                     timeout=LOGIN_CHECK_TIMEOUT
                 )
+                # 等待页面跳转完全稳定，避免 evaluate 时上下文被销毁
+                try:
+                    self.page.wait_for_load_state('networkidle', timeout=5000)
+                except Exception:
+                    pass
                 time.sleep(2)
 
                 current_url = self.page.url
@@ -5187,16 +5200,19 @@ class PageDrivenTaskExecutor:
             except Exception as e:
                 error_str = str(e).lower()
                 is_timeout = 'timeout' in error_str
+                is_navigation = 'execution context was destroyed' in error_str or \
+                                'most likely because of a navigation' in error_str
 
-                if is_timeout:
+                if is_timeout or is_navigation:
                     if attempt < max_retries:
                         delay = calculate_retry_delay(attempt)
-                        logger.warning(f"登录检测超时，第 {attempt}/{max_retries} 次尝试，"
+                        reason = "超时" if is_timeout else "页面跳转导致上下文销毁"
+                        logger.warning(f"登录检测{reason}，第 {attempt}/{max_retries} 次尝试，"
                                        f"{delay:.1f} 秒后重试...")
                         time.sleep(delay)
                         continue
                     else:
-                        logger.error(f"登录检测超时，已重试 {max_retries} 次: {e}")
+                        logger.error(f"登录检测失败，已重试 {max_retries} 次: {e}")
                         return False, "timeout"
                 else:
                     logger.error(f"登录检测失败: {e}")
