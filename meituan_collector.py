@@ -853,6 +853,26 @@ class AuthInvalidError(Exception):
     pass
 
 
+class NoAccessError(Exception):
+    """无访问权限异常
+
+    当账号无访问权限时抛出此异常，跳过当前子任务并继续执行后续任务
+    """
+    pass
+
+
+def is_no_access_error(message: str) -> bool:
+    """检测错误信息是否为无访问权限错误"""
+    if not message:
+        return False
+    no_access_keywords = ["无访问权限", "账号下无有权限门店"]
+    message_str = str(message)
+    for keyword in no_access_keywords:
+        if keyword in message_str:
+            return True
+    return False
+
+
 def upload_task_status_batch(account_id: str, start_date: str, end_date: str, results: List[Dict[str, Any]]) -> bool:
     """批量上报所有任务状态到API
 
@@ -903,8 +923,14 @@ def upload_task_status_batch(account_id: str, start_date: str, end_date: str, re
         record_count = result.get('record_count', 0)
         error_message = result.get('error_message', '无')
 
-        # 状态码: success=True -> 2, success=False -> 3
-        status = 2 if success else 3
+        # 状态码: success=True -> 2, no_access=True -> 4, success=False -> 3
+        no_access = result.get('no_access', False)
+        if success:
+            status = 2
+        elif no_access:
+            status = 4
+        else:
+            status = 3
         # 错误信息: success=True -> None, success=False -> 实际错误信息
         error = None if success else error_message
 
@@ -2155,7 +2181,10 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
                     time.sleep(delay)
                     continue
                 else:
-                    raise Exception(f"报表下载重试 {MAX_RETRY_ATTEMPTS} 次均失败: {last_error_message}")
+                    final_msg = f"报表下载重试 {MAX_RETRY_ATTEMPTS} 次均失败: {last_error_message}"
+                    if is_no_access_error(last_error_message):
+                        raise NoAccessError(final_msg)
+                    raise Exception(final_msg)
 
             random_delay()  # 反爬虫等待
 
@@ -2301,6 +2330,12 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
         # 登录失效异常 - 已在检测时调用 handle_auth_invalid，这里只记录结果
         result["error_message"] = str(e)
         print(f"❌ 登录失效，任务终止: {e}")
+
+    except NoAccessError as e:
+        # 无访问权限 - 跳过此任务，继续后续任务
+        result["error_message"] = str(e)
+        result["no_access"] = True
+        print(f"⚠️ 无访问权限，跳过此任务: {e}")
 
     except Exception as e:
         result["error_message"] = str(e)
@@ -6317,17 +6352,8 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
             print(f"✅ 已成功获取 templates_id: {templates_id}")
         else:
             error_msg = "无法获取或创建报表模板ID"
-            print(f"❌ {error_msg}")
-            # 同时上报到两个日志接口
+            print(f"⚠️ {error_msg}，将继续执行其余任务（报表相关任务将跳过）")
             log_failure(account_name, 0, "templates_id_check", start_date, end_date, error_msg)
-            upload_task_status_batch(account_name, start_date, end_date, [{
-                'task_name': 'templates_id_check',
-                'success': False,
-                'record_count': 0,
-                'error_message': error_msg
-            }])
-            report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
-            return False
 
     print(f"   ✅ templates_id 检查通过: {templates_id}")
 
@@ -6374,15 +6400,26 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
 
     # 收集错误并上报任务回调
     task_errors = []
+    has_no_access = False
+    has_real_error = False
     for result in results:
         if not result.get('success'):
             task_name = result.get('task_name', '未知任务')
             error_msg = result.get('error_message', '未知错误')
             task_errors.append(f"[{task_name}] {error_msg}")
+            if result.get('no_access') or is_no_access_error(error_msg):
+                has_no_access = True
+            else:
+                has_real_error = True
 
     if len(task_errors) == 0:
         report_task_callback(task_id, status=2, error_message="", retry_add=0)
         return True
+    elif has_no_access and not has_real_error:
+        # 所有失败均为无访问权限，上报 status=4，不需要重试
+        all_errors = "\n".join(task_errors)
+        report_task_callback(task_id, status=4, error_message=all_errors, retry_add=0)
+        return False
     else:
         all_errors = "\n".join(task_errors)
         report_task_callback(task_id, status=3, error_message=all_errors, retry_add=1)
