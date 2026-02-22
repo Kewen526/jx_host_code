@@ -1528,9 +1528,6 @@ class BrowserPoolManager:
             for account_id, wrapper in self._contexts.items():
                 saved_cookies[account_id] = wrapper.get_cookies()
 
-            # 【重要】保存已知账号列表（重启后需要恢复）
-            all_known_accounts = list(self._known_accounts)
-
             # 关闭所有Context
             for wrapper in self._contexts.values():
                 try:
@@ -1571,43 +1568,21 @@ class BrowserPoolManager:
                 print(f"   ❌ 重启 Playwright driver 失败: {e}")
                 raise
 
-            # 步骤1：从内存保存的Cookie恢复
-            restored = 0
-            restored_accounts = set()
+            # 【关键修复】不再预建 Context，改为把 Cookie 上传到服务器
+            # 原因：预建所有账号 Context 会触发 enforce_context_limit()，
+            # 因为 MAX_ACTIVE_CONTEXTS=10 远小于账号总数（~150），
+            # 导致重启后立即批量清洗，所有账号的 Context 全部丢失。
+            # 修复方案：把 Cookie 上传到服务器保存，Context 由任务按需懒建。
+            uploaded = 0
             for account_id, cookies in saved_cookies.items():
-                try:
-                    if cookies:
-                        self.get_context(account_id, cookies)
-                        restored += 1
-                        restored_accounts.add(account_id)
-                except Exception as e:
-                    print(f"   ⚠️ 恢复 {account_id} 失败: {e}")
+                if cookies:
+                    try:
+                        upload_cookie_sync(account_id, cookies)
+                        uploaded += 1
+                    except Exception as e:
+                        print(f"   ⚠️ 上传Cookie失败 {account_id}: {e}")
 
-            print(f"   ✅ 从内存恢复 {restored} 个账号")
-
-        # 步骤2：从API补全缺失的账号（在锁外执行，避免长时间持锁）
-        # 【新方案】使用 _known_accounts 而不是调用不存在的API
-        missing_accounts = [acc for acc in all_known_accounts if acc not in restored_accounts]
-
-        if missing_accounts:
-            print(f"   🔄 从API补全 {len(missing_accounts)} 个缺失账号的Cookie...")
-            api_restored = 0
-            for account_id in missing_accounts:
-                try:
-                    cookies = fetch_account_cookie(account_id)
-                    if cookies:
-                        self.get_context(account_id, cookies)
-                        api_restored += 1
-                        print(f"   ✅ 从API补全: {account_id}")
-                except Exception as e:
-                    print(f"   ⚠️ 从API恢复 {account_id} 失败: {e}")
-
-            print(f"   ✅ 从API补全 {api_restored} 个账号")
-            restored += api_restored
-        else:
-            print("   ✅ 所有账号已恢复，无需补全")
-
-        print(f"   ✅ 浏览器重启完成，共恢复 {restored} 个账号")
+            print(f"   ✅ 已将 {uploaded} 个账号的Cookie上传到服务器，Context 将按需懒建")
 
         self._last_restart_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -1760,7 +1735,15 @@ class BrowserPoolManager:
             )
 
             released = 0
-            for account_id, wrapper in sorted_accounts[:to_release]:
+            for account_id, wrapper in sorted_accounts:
+                if released >= to_release:
+                    break
+
+                # 跳过正在执行任务的账号，避免强杀导致任务误失败累积重试次数
+                if account_lock_manager.is_locked(account_id):
+                    log_warn(f"超限释放跳过: {account_id} 正在执行任务，不强杀")
+                    continue
+
                 try:
                     browser_index = wrapper.browser_index
 
