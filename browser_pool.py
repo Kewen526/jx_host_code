@@ -1517,6 +1517,8 @@ class BrowserPoolManager:
         """重启所有Browser（用于释放内存）
 
         【新方案】使用 _known_accounts 恢复，不依赖 fetch_all_account_ids()
+        同时重启 Playwright driver，避免长时间运行后 driver 进入异常状态
+        导致 "Connection closed while reading from the driver" 错误。
         """
         print("\n🔄 开始重启浏览器...")
 
@@ -1548,6 +1550,26 @@ class BrowserPoolManager:
             self._browser_context_counts = [0] * self.max_browsers
 
             print("   ✅ 所有Browser已关闭")
+
+            # 【关键修复】重启 Playwright driver
+            # 原因：driver 是一个 Node.js 子进程，长时间运行后会积累内部状态，
+            # 在关闭所有浏览器后再 launch 新浏览器时会崩溃报
+            # "Connection closed while reading from the driver"。
+            # 解决方案：每次重启浏览器时同步重启 driver。
+            if self._playwright:
+                try:
+                    self._playwright.stop()
+                    print("   ✅ Playwright driver 已停止")
+                except Exception as e:
+                    print(f"   ⚠️ 停止 Playwright driver 失败（忽略）: {e}")
+                self._playwright = None
+
+            try:
+                self._playwright = sync_playwright().start()
+                print("   ✅ Playwright driver 已重启")
+            except Exception as e:
+                print(f"   ❌ 重启 Playwright driver 失败: {e}")
+                raise
 
             # 步骤1：从内存保存的Cookie恢复
             restored = 0
