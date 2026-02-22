@@ -1735,7 +1735,15 @@ class BrowserPoolManager:
             )
 
             released = 0
-            for account_id, wrapper in sorted_accounts[:to_release]:
+            for account_id, wrapper in sorted_accounts:
+                if released >= to_release:
+                    break
+
+                # 跳过正在执行任务的账号，避免强杀导致任务误失败累积重试次数
+                if account_lock_manager.is_locked(account_id):
+                    log_warn(f"超限释放跳过: {account_id} 正在执行任务，不强杀")
+                    continue
+
                 try:
                     browser_index = wrapper.browser_index
 

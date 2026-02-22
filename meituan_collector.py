@@ -6073,6 +6073,22 @@ def fetch_task(server_ip: str = None) -> Optional[Dict[str, Any]]:
         return None
 
 
+def is_context_closed_error(e: Exception) -> bool:
+    """判断异常是否由 Playwright Context/Browser 被关闭引起（硬件或代码原因，非业务失败）"""
+    error_str = str(e).lower()
+    keywords = [
+        'context was destroyed',
+        'target page, context or browser has been closed',
+        'browser has been closed',
+        'browser context was destroyed',
+        'target closed',
+        'page has been closed',
+        'connection closed',
+        'playwright._impl._errors.targetclosederror',
+    ]
+    return any(kw in error_str for kw in keywords)
+
+
 def report_task_callback(task_id: int, status: int, error_message: str, retry_add: int) -> bool:
     """上报任务完成状态
 
@@ -6386,7 +6402,13 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
     except Exception as e:
         error_msg = f"任务执行异常: {str(e)}"
         print(f"❌ {error_msg}")
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        if is_context_closed_error(e):
+            # Context 被硬件/代码原因强制关闭，不是业务失败，不计入重试次数
+            # 直接归还任务到队列，等待下次调度重新执行
+            print("⚠️ 检测到 Context 被关闭（非业务失败），归还任务到队列，不计重试次数")
+            reset_task_schedule(task_id)
+        else:
+            report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     print_summary(results)
