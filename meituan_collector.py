@@ -6466,6 +6466,37 @@ def main():
     """
     global _daemon_running
 
+    # ========== 单例检查: 防止多进程同时运行 ==========
+    PID_FILE = "/home/meituan/data/meituan_collector.pid"
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as _f:
+                _old_pid = int(_f.read().strip())
+            # 检查旧进程是否仍在运行
+            os.kill(_old_pid, 0)
+            print(f"❌ 已有实例正在运行 (PID={_old_pid})，本次启动退出。")
+            print(f"   若旧进程已卡死，请先执行: kill {_old_pid} && rm {PID_FILE}")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # 旧进程已不存在，清理残留 PID 文件
+            os.remove(PID_FILE)
+
+    # 写入当前 PID
+    with open(PID_FILE, "w") as _f:
+        _f.write(str(os.getpid()))
+
+    def _remove_pid_file():
+        try:
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
+        except Exception:
+            pass
+
+    import atexit
+    atexit.register(_remove_pid_file)
+
     # ========== 初始化 ==========
     print("\n" + "=" * 80)
     print("美团点评数据采集系统 (守护进程模式)")
