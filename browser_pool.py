@@ -18,6 +18,7 @@ import time
 import queue
 import signal
 import socket
+import subprocess
 import requests
 import threading
 from datetime import datetime, timedelta
@@ -71,6 +72,10 @@ CONTEXT_IDLE_TIMEOUT = 30 * 60       # Context空闲超时（秒）：30分钟
 # 浏览器重启配置
 BROWSER_RESTART_HOUR = 14            # 每天重启时间（14点，任务少的时候）
 BROWSER_MAX_RESTART_RETRIES = 3      # 重启失败最大重试次数
+
+# Playwright driver 自愈配置
+DRIVER_RESTART_SLEEP_SEC = 2         # driver 启动后等待时间（秒），确保 Node.js 进程就绪
+DRIVER_ERROR_THRESHOLD = 1           # 触发自动重启的连续 driver 错误次数
 
 # Cookie上传配置
 COOKIE_UPLOAD_QUEUE_SIZE = 1000      # Cookie上传队列大小
@@ -978,6 +983,10 @@ class BrowserPoolManager:
         self._initialized = False
         self._last_restart_date: Optional[str] = None
 
+        # driver 自愈状态
+        self._driver_consecutive_errors: int = 0  # 连续 driver 错误计数
+        self._driver_restarting: bool = False      # 防止并发重入的标志
+
     def initialize(self):
         """初始化浏览器池"""
         if self._initialized:
@@ -1053,27 +1062,79 @@ class BrowserPoolManager:
         }
 
     def _create_browser(self, index: int) -> Optional[Browser]:
-        """创建Browser实例"""
+        """创建Browser实例
+
+        当检测到 "Connection closed while reading from the driver" 错误时，
+        自动触发 driver 重启并重试一次（Fix 2+5：自动检测+跨任务自愈）。
+        """
         if not self._playwright:
             return None
 
-        try:
-            launch_args = self._get_browser_launch_args()
+        launch_args = self._get_browser_launch_args()
 
+        def _do_launch() -> Browser:
+            """执行实际的 browser launch"""
             if BROWSER_TYPE == "webkit":
-                browser = self._playwright.webkit.launch(**launch_args)
+                return self._playwright.webkit.launch(**launch_args)
             elif BROWSER_TYPE == "firefox":
-                browser = self._playwright.firefox.launch(**launch_args)
+                return self._playwright.firefox.launch(**launch_args)
             else:
-                browser = self._playwright.chromium.launch(**launch_args)
+                return self._playwright.chromium.launch(**launch_args)
 
+        try:
+            browser = _do_launch()
             self._browsers[index] = browser
             self._browser_context_counts[index] = 0
+            self._driver_consecutive_errors = 0  # 成功后重置计数
             print(f"   ✅ Browser {index} 创建成功 ({BROWSER_TYPE})")
             return browser
 
         except Exception as e:
+            error_msg = str(e)
             print(f"   ❌ Browser {index} 创建失败: {e}")
+
+            # 检测 driver 连接断开的特征错误（Fix 2+5）
+            is_driver_error = "Connection closed while reading from the driver" in error_msg
+
+            if is_driver_error and not self._driver_restarting:
+                self._driver_consecutive_errors += 1
+                print(
+                    f"   ⚠️ 检测到 Playwright driver 连接断开"
+                    f"（连续第 {self._driver_consecutive_errors} 次），触发自动恢复..."
+                )
+                self._driver_restarting = True
+                try:
+                    # 自动恢复 driver（包含：清理孤儿进程、sleep、验证）
+                    self._restart_playwright_driver_verified()
+
+                    # driver 重启后旧的 Browser 对象全部失效，必须清理
+                    # （当前 index 的 browser 就是本次要创建的，无需额外清理）
+                    for i, old_browser in enumerate(self._browsers):
+                        if old_browser is not None and i != index:
+                            try:
+                                old_browser.close()
+                            except Exception:
+                                pass
+                            self._browsers[i] = None
+                            self._browser_context_counts[i] = 0
+
+                    # 恢复后立即重试一次 launch
+                    if self._playwright:
+                        try:
+                            browser = _do_launch()
+                            self._browsers[index] = browser
+                            self._browser_context_counts[index] = 0
+                            self._driver_consecutive_errors = 0
+                            print(f"   ✅ Browser {index} 自动恢复成功 ({BROWSER_TYPE})")
+                            return browser
+                        except Exception as retry_e:
+                            print(f"   ❌ Browser {index} 恢复后重试仍失败: {retry_e}")
+
+                except Exception as recover_e:
+                    print(f"   ❌ Playwright driver 自动恢复失败: {recover_e}")
+                finally:
+                    self._driver_restarting = False
+
             return None
 
     def _is_browser_healthy(self, browser: Browser) -> bool:
@@ -1513,6 +1574,122 @@ class BrowserPoolManager:
         print(f"   ✅ 从API补全完成: 成功 {api_restored} 个，失败 {api_failed} 个")
         print(f"   📊 总计恢复: {len(restored_accounts)} 个账号")
 
+    def _kill_orphan_playwright_processes(self):
+        """强制清理残留的 playwright/node 子进程
+
+        当 playwright.stop() 因异常无法正常终止 driver 进程时调用，
+        防止新 driver 启动时与旧进程冲突（管道/端口占用）。
+        使用 SIGKILL 确保进程被强制终止。
+        """
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', 'playwright/cli'],
+                capture_output=True, text=True, timeout=5
+            )
+            pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+            if pids:
+                print(f"   🔪 发现 {len(pids)} 个残留 playwright 进程，强制清理...")
+                for pid in pids:
+                    try:
+                        subprocess.run(['kill', '-9', pid], capture_output=True, timeout=3)
+                        print(f"      已终止 PID={pid}")
+                    except Exception:
+                        pass
+                time.sleep(0.5)  # 等待进程退出
+        except Exception as e:
+            print(f"   ⚠️ 清理残留进程异常（忽略）: {e}")
+
+    def _restart_playwright_driver_verified(self):
+        """停止旧 driver，启动并验证新 driver 可用
+
+        核心修复逻辑，解决以下问题：
+        1. sync_playwright().start() 成功但 driver 进程未完全就绪（Fix 4：加 sleep）
+        2. playwright.stop() 失败导致旧进程残留冲突（Fix 3：清理孤儿进程）
+        3. driver 启动后无法 launch browser（Fix 1：实际 launch 验证）
+        4. 所有重试均内置指数退避
+
+        注意：在 self._lock 持有期间调用是安全的（RLock 可重入）。
+
+        Raises:
+            RuntimeError: 所有重试均失败时抛出，由调用方决定如何处理
+        """
+        # 1. 停止旧 driver
+        if self._playwright:
+            try:
+                self._playwright.stop()
+                print("   ✅ Playwright driver 已停止")
+            except Exception as e:
+                print(f"   ⚠️ 停止 Playwright driver 失败: {e}，尝试强制清理残留进程")
+                self._kill_orphan_playwright_processes()
+            self._playwright = None
+
+        # 2. 等待旧进程完全退出，避免 pipe/socket 冲突
+        time.sleep(DRIVER_RESTART_SLEEP_SEC)
+
+        # 3. 启动新 driver 并验证（最多 BROWSER_MAX_RESTART_RETRIES 次）
+        last_error = None
+        for attempt in range(1, BROWSER_MAX_RESTART_RETRIES + 1):
+            try:
+                # 3a. 启动 driver
+                self._playwright = sync_playwright().start()
+
+                # 3b. 等待 Node.js driver 进程完全就绪（关键！）
+                time.sleep(DRIVER_RESTART_SLEEP_SEC)
+
+                # 3c. 验证：实际 launch + 立即关闭一个测试浏览器
+                #     仅用于验证，不放入浏览器池
+                verify_args = {
+                    'headless': True,
+                    'args': ['--no-sandbox', '--disable-setuid-sandbox',
+                             '--disable-dev-shm-usage']
+                }
+                test_browser = None
+                try:
+                    if BROWSER_TYPE == "webkit":
+                        test_browser = self._playwright.webkit.launch(**verify_args)
+                    elif BROWSER_TYPE == "firefox":
+                        test_browser = self._playwright.firefox.launch(**verify_args)
+                    else:
+                        test_browser = self._playwright.chromium.launch(**verify_args)
+                    test_browser.close()
+                    test_browser = None
+                except Exception as ve:
+                    # 验证失败：driver 启动了但无法 launch browser
+                    if test_browser:
+                        try:
+                            test_browser.close()
+                        except Exception:
+                            pass
+                    raise RuntimeError(f"driver 验证失败: {ve}") from ve
+
+                print(f"   ✅ Playwright driver 已重启并验证（第 {attempt} 次）")
+                self._driver_consecutive_errors = 0
+                return  # 成功
+
+            except Exception as e:
+                last_error = e
+                print(f"   ❌ Playwright driver 重启失败（第 {attempt}/{BROWSER_MAX_RESTART_RETRIES} 次）: {e}")
+
+                # 清理失败的 playwright 实例
+                if self._playwright:
+                    try:
+                        self._playwright.stop()
+                    except Exception:
+                        pass
+                    self._playwright = None
+
+                # 强制清理可能残留的孤儿进程
+                self._kill_orphan_playwright_processes()
+
+                if attempt < BROWSER_MAX_RESTART_RETRIES:
+                    wait_sec = 2 ** attempt  # 指数退避：2s, 4s
+                    print(f"   ⏳ 等待 {wait_sec} 秒后重试...")
+                    time.sleep(wait_sec)
+
+        raise RuntimeError(
+            f"Playwright driver 经过 {BROWSER_MAX_RESTART_RETRIES} 次重试仍无法启动: {last_error}"
+        )
+
     def restart_browsers(self):
         """重启所有Browser（用于释放内存）
 
@@ -1548,25 +1725,13 @@ class BrowserPoolManager:
 
             print("   ✅ 所有Browser已关闭")
 
-            # 【关键修复】重启 Playwright driver
-            # 原因：driver 是一个 Node.js 子进程，长时间运行后会积累内部状态，
-            # 在关闭所有浏览器后再 launch 新浏览器时会崩溃报
-            # "Connection closed while reading from the driver"。
-            # 解决方案：每次重启浏览器时同步重启 driver。
-            if self._playwright:
-                try:
-                    self._playwright.stop()
-                    print("   ✅ Playwright driver 已停止")
-                except Exception as e:
-                    print(f"   ⚠️ 停止 Playwright driver 失败（忽略）: {e}")
-                self._playwright = None
-
-            try:
-                self._playwright = sync_playwright().start()
-                print("   ✅ Playwright driver 已重启")
-            except Exception as e:
-                print(f"   ❌ 重启 Playwright driver 失败: {e}")
-                raise
+            # 重启 Playwright driver（含等待和验证）
+            # 使用 _restart_playwright_driver_verified() 统一处理：
+            #   - 清理残留孤儿进程（Fix 3）
+            #   - 启动后 sleep 等待就绪（Fix 4）
+            #   - 实际 launch 测试浏览器验证（Fix 1）
+            #   - 失败时指数退避重试
+            self._restart_playwright_driver_verified()
 
             # 【关键修复】不再预建 Context，改为把 Cookie 上传到服务器
             # 原因：预建所有账号 Context 会触发 enforce_context_limit()，
