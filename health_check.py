@@ -96,6 +96,29 @@ def get_public_ip():
             return resp.text.strip()
     except Exception:
         pass
+    # 阿里云ECS元数据服务（内网可达，无需公网）
+    try:
+        resp = requests.get("http://100.100.100.200/latest/meta-data/eipv4", timeout=3)
+        if resp.status_code == 200 and resp.text.strip():
+            return resp.text.strip()
+    except Exception:
+        pass
+    try:
+        resp = requests.get("http://100.100.100.200/latest/meta-data/public-ipv4", timeout=3)
+        if resp.status_code == 200 and resp.text.strip():
+            return resp.text.strip()
+    except Exception:
+        pass
+    # 最终兜底：取本机出口IP（不依赖外网）
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        pass
     return os.uname().nodename  # 兜底用主机名
 
 
