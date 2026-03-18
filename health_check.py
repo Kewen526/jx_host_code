@@ -272,8 +272,8 @@ def check_log_freshness():
     return result
 
 
-def check_recent_errors():
-    """检查最近日志中的错误"""
+def check_recent_errors(process_start_time=None):
+    """检查最近日志中的错误，只检查当前进程启动后的日志行"""
     result = {
         "name": "recent_errors",
         "healthy": True,
@@ -303,6 +303,8 @@ def check_recent_errors():
     fatal_pattern = re.compile(
         "|".join(FATAL_KEYWORDS), re.IGNORECASE
     )
+    # 日志行时间戳格式: [2026-03-19 04:01:52.401]
+    log_ts_pattern = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
 
     errors_found = []
     fatal_found = []
@@ -311,6 +313,16 @@ def check_recent_errors():
         line_stripped = line.strip()
         if not line_stripped:
             continue
+        # 跳过进程启动前的旧日志行（避免上次正常退出的消息误报）
+        if process_start_time:
+            ts_match = log_ts_pattern.match(line_stripped)
+            if ts_match:
+                try:
+                    line_time = datetime.strptime(ts_match.group(1), "%Y-%m-%d %H:%M:%S")
+                    if line_time < process_start_time:
+                        continue
+                except ValueError:
+                    pass
         if error_pattern.search(line_stripped):
             errors_found.append(line_stripped[:200])  # 截断过长行
         if fatal_pattern.search(line_stripped):
@@ -455,9 +467,17 @@ def run_all_checks():
     proc = check_process_alive()
     threads = check_thread_count()
     log = check_log_freshness()
-    errors = check_recent_errors()
     resources = check_system_resources()
     uptime = check_process_uptime()
+
+    # 解析进程启动时间，传给 check_recent_errors 过滤旧日志行
+    process_start_dt = None
+    if uptime.get("started_at"):
+        try:
+            process_start_dt = datetime.strptime(uptime["started_at"], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    errors = check_recent_errors(process_start_time=process_start_dt)
 
     # 只用进程存活、日志新鲜度、系统资源判断服务是否正常运行
     # recent_errors 不参与健康判断（业务日志中的"失败"字样不代表服务挂了）
@@ -467,13 +487,14 @@ def run_all_checks():
     all_checks = [proc, threads, log, errors, resources, uptime]
 
     # 拍平为一级字段，平台 #{} 可直接取值
+    # unhealthy_items / recent_errors 序列化为 JSON 字符串，兼容数据库 TEXT 列
     report = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "hostname": get_public_ip(),
         "service": PROCESS_NAME,
         "healthy": 1 if overall_healthy else 0,
         "status": "healthy" if overall_healthy else "unhealthy",
-        "unhealthy_items": unhealthy_items,
+        "unhealthy_items": json.dumps(unhealthy_items, ensure_ascii=False),
         "summary": _build_summary(all_checks, overall_healthy),
         # 进程存活
         "process_alive": 1 if proc["healthy"] else 0,
@@ -490,7 +511,7 @@ def run_all_checks():
         "no_errors": 1 if errors["healthy"] else 0,
         "error_count": errors.get("error_count", 0),
         "fatal_count": errors.get("fatal_count", 0),
-        "recent_errors": errors.get("errors", []),
+        "recent_errors": json.dumps(errors.get("errors", []), ensure_ascii=False),
         # 系统资源
         "resources_ok": 1 if resources["healthy"] else 0,
         "disk_percent": resources.get("disk_percent") or 0,
