@@ -49,9 +49,9 @@ PID_FILE = "/home/meituan/data/meituan_collector.pid"
 LOG_FILE = "/home/meituan/data/run.log"
 PROCESS_NAME = "meituan_collector"
 
-# 健康上报API（复用现有服务器）
-API_BASE = "http://8.146.210.145:3000"
-HEALTH_REPORT_API = f"{API_BASE}/api/health_report"
+# 健康上报API（通过API管理平台）
+API_BASE = "https://kewenai.asia"
+HEALTH_REPORT_API = f"{API_BASE}/api/health-reports/upsert"
 
 # 阈值
 LOG_STALE_MINUTES = 10        # 日志超过10分钟没更新 → 可能卡死
@@ -408,30 +408,53 @@ def check_process_uptime():
 # ============================================================================
 
 def run_all_checks():
-    """执行所有检查项，汇总结果"""
-    checks = [
-        check_process_alive(),
-        check_thread_count(),
-        check_log_freshness(),
-        check_recent_errors(),
-        check_system_resources(),
-        check_process_uptime(),
-    ]
+    """执行所有检查项，汇总结果（拍平为一级字段，适配API管理平台）"""
+    proc = check_process_alive()
+    threads = check_thread_count()
+    log = check_log_freshness()
+    errors = check_recent_errors()
+    resources = check_system_resources()
+    uptime = check_process_uptime()
 
+    checks = [proc, threads, log, errors, resources, uptime]
     overall_healthy = all(c["healthy"] for c in checks)
     unhealthy_items = [c["name"] for c in checks if not c["healthy"]]
 
-    # 构建上报数据
+    # 拍平为一级字段，平台 #{} 可直接取值
     report = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "hostname": os.uname().nodename,
         "service": PROCESS_NAME,
-        "healthy": overall_healthy,
+        "healthy": 1 if overall_healthy else 0,
         "status": "healthy" if overall_healthy else "unhealthy",
-        "unhealthy_items": unhealthy_items,
+        "unhealthy_items": ",".join(unhealthy_items) if unhealthy_items else "",
         "summary": _build_summary(checks, overall_healthy),
-        "checks": {c["name"]: c for c in checks},
+        # 进程存活
+        "process_alive": 1 if proc["healthy"] else 0,
+        "pid": str(proc.get("pid", "")) if proc.get("pid") else "",
+        "process_cpu": float(proc.get("cpu", 0) or 0),
+        "process_mem": float(proc.get("mem", 0) or 0),
+        # 线程数
+        "thread_count": threads.get("thread_count", 0),
+        # 日志新鲜度
+        "log_fresh": 1 if log["healthy"] else 0,
+        "log_stale_minutes": log.get("stale_minutes") or 0,
+        "log_last_modified": log.get("last_modified", ""),
+        # 错误
+        "no_errors": 1 if errors["healthy"] else 0,
+        "error_count": errors.get("error_count", 0),
+        "fatal_count": errors.get("fatal_count", 0),
+        "recent_errors": json.dumps(errors.get("errors", []), ensure_ascii=False),
+        # 系统资源
+        "resources_ok": 1 if resources["healthy"] else 0,
+        "disk_percent": resources.get("disk_percent") or 0,
+        # 运行时长
+        "uptime_seconds": uptime.get("uptime_seconds") or 0,
+        "started_at": uptime.get("started_at", ""),
     }
+
+    # 保留原始 checks 供本地打印使用
+    report["_checks"] = {c["name"]: c for c in checks}
 
     return report
 
@@ -449,14 +472,17 @@ def _build_summary(checks, overall_healthy):
 
 
 def upload_report(report, api_url=None, dry_run=False):
-    """上报健康状态到API"""
+    """上报健康状态到API（发送拍平的一级字段）"""
     url = api_url or HEALTH_REPORT_API
+
+    # 排除内部字段，只发平台需要的一级字段
+    payload = {k: v for k, v in report.items() if not k.startswith("_")}
 
     if dry_run:
         print(f"\n{'='*60}")
         print(f"[DRY-RUN] 以下数据将上报到: {url}")
         print(f"{'='*60}")
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return True
 
     if requests is None:
@@ -466,7 +492,7 @@ def upload_report(report, api_url=None, dry_run=False):
     try:
         resp = requests.post(
             url,
-            json=report,
+            json=payload,
             timeout=15,
             headers={"Content-Type": "application/json"},
         )
@@ -483,7 +509,8 @@ def upload_report(report, api_url=None, dry_run=False):
 
 def print_report(report):
     """在终端打印健康报告"""
-    status_icon = "✅" if report["healthy"] else "❌"
+    is_healthy = report["healthy"] == 1 if isinstance(report["healthy"], int) else report["healthy"]
+    status_icon = "✅" if is_healthy else "❌"
     print(f"\n{'='*60}")
     print(f" {status_icon} 美团采集服务健康报告")
     print(f" 时间: {report['timestamp']}")
@@ -491,11 +518,13 @@ def print_report(report):
     print(f" 状态: {report['status'].upper()}")
     print(f"{'='*60}")
 
-    for name, check in report["checks"].items():
+    # 使用内部保留的 _checks 打印详情
+    checks = report.get("_checks", {})
+    for name, check in checks.items():
         icon = "✅" if check["healthy"] else "❌"
         print(f"  {icon} {name}: {check['detail']}")
 
-    if not report["healthy"]:
+    if not is_healthy:
         print(f"\n  ⚠️ 摘要: {report['summary']}")
 
     print(f"{'='*60}\n")
