@@ -96,6 +96,29 @@ def get_public_ip():
             return resp.text.strip()
     except Exception:
         pass
+    # 阿里云ECS元数据服务（内网可达，无需公网）
+    try:
+        resp = requests.get("http://100.100.100.200/latest/meta-data/eipv4", timeout=3)
+        if resp.status_code == 200 and resp.text.strip():
+            return resp.text.strip()
+    except Exception:
+        pass
+    try:
+        resp = requests.get("http://100.100.100.200/latest/meta-data/public-ipv4", timeout=3)
+        if resp.status_code == 200 and resp.text.strip():
+            return resp.text.strip()
+    except Exception:
+        pass
+    # 最终兜底：取本机出口IP（不依赖外网）
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        pass
     return os.uname().nodename  # 兜底用主机名
 
 
@@ -436,9 +459,12 @@ def run_all_checks():
     resources = check_system_resources()
     uptime = check_process_uptime()
 
-    checks = [proc, threads, log, errors, resources, uptime]
+    # 只用进程存活、日志新鲜度、系统资源判断服务是否正常运行
+    # recent_errors 不参与健康判断（业务日志中的"失败"字样不代表服务挂了）
+    checks = [proc, threads, log, resources, uptime]
     overall_healthy = all(c["healthy"] for c in checks)
     unhealthy_items = [c["name"] for c in checks if not c["healthy"]]
+    all_checks = [proc, threads, log, errors, resources, uptime]
 
     # 拍平为一级字段，平台 #{} 可直接取值
     report = {
@@ -448,7 +474,7 @@ def run_all_checks():
         "healthy": 1 if overall_healthy else 0,
         "status": "healthy" if overall_healthy else "unhealthy",
         "unhealthy_items": unhealthy_items,
-        "summary": _build_summary(checks, overall_healthy),
+        "summary": _build_summary(all_checks, overall_healthy),
         # 进程存活
         "process_alive": 1 if proc["healthy"] else 0,
         "pid": str(proc.get("pid", "")) if proc.get("pid") else "",
@@ -474,7 +500,7 @@ def run_all_checks():
     }
 
     # 保留原始 checks 供本地打印使用
-    report["_checks"] = {c["name"]: c for c in checks}
+    report["_checks"] = {c["name"]: c for c in all_checks}
 
     return report
 
