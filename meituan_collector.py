@@ -118,6 +118,12 @@ GET_PLATFORM_ACCOUNT_API_URL = "http://8.146.210.145:3000/api/get_platform_accou
 POST_STORES_REGIONS_API_URL = "http://8.146.210.145:3000/api/post/platform_accounts"  # 门店/商圈数据回传API
 SAVE_DIR = DOWNLOAD_DIR  # 使用绝对路径
 
+# store_daily_stats 相关API配置
+STORE_DAILY_STATS_ACCOUNT_API_URL = "https://kewenai.asia/api/platform-account/get-by-account"
+STORE_DAILY_STATS_UPSERT_API_URL = "https://kewenai.asia/api/store-daily-stats/upsert"
+# 评价分析页面URL（store_daily_stats任务3需要）
+PAGE_REVIEW_ANALYSIS = "https://e.dianping.com/app/merchant-platform/37dc7783ff6a45e?iUrl=Ly9oNS5kaWFucGluZy5jb20vYXBwL21lcmNoYW50LW1hbmFnZS1hZHZpY2UtcGMtc3RhdGljL2FkdmljZS1hcHByYWlzYWwtYW5hbHlzaXMuaHRtbA"
+
 # ============================================================================
 # 报表模板相关API配置
 # ============================================================================
@@ -1039,6 +1045,560 @@ def random_delay(min_seconds: float = 2, max_seconds: float = 5):
     delay = random.uniform(min_seconds, max_seconds)
     print(f"⏳ 反爬虫等待 {delay:.1f} 秒...")
     time.sleep(delay)
+
+
+# ============================================================================
+# ★★★ store_daily_stats 门店每日统计数据采集 ★★★
+# ============================================================================
+
+def safe_int_value(val, default=0) -> int:
+    """安全转换为整数，处理NaN和无效值"""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return default
+    try:
+        return int(float(str(val)))
+    except:
+        return default
+
+
+def _get_store_daily_stats_mtgsig(cookies: dict, mtgsig_from_api: str = None) -> str:
+    """获取store_daily_stats请求的mtgsig签名"""
+    if mtgsig_from_api:
+        return mtgsig_from_api
+    ts = int(time.time() * 1000)
+    webdfpid = cookies.get('WEBDFPID', '')
+    a3 = webdfpid.split('-')[0] if webdfpid and '-' in webdfpid else ''
+    return json.dumps({
+        "a1": "1.2", "a2": ts, "a3": a3,
+        "a5": "", "a6": "", "a8": "", "a9": "4.2.0,7,168",
+        "a10": "9a", "x0": 4, "d1": ""
+    })
+
+
+def _get_store_daily_stats_headers() -> dict:
+    """获取store_daily_stats请求头"""
+    return {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+        'Connection': 'keep-alive',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://h5.dianping.com',
+        'Referer': 'https://h5.dianping.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    }
+
+
+def _download_excel_from_api(session: requests.Session, cookies: dict, mtgsig: str,
+                             component_id: str, page_type: str, post_data: dict) -> Optional[pd.DataFrame]:
+    """POST请求触发下载，从响应 data[0].body.fileUrl 获取文件，返回 DataFrame"""
+    url = "https://e.dianping.com/gateway/adviser/data"
+    params = {
+        'componentId': component_id,
+        'pageType': page_type,
+        'yodaReady': 'h5',
+        'csecplatform': '4',
+        'csecversion': '4.2.0',
+        'mtgsig': _get_store_daily_stats_mtgsig(cookies, mtgsig),
+    }
+
+    try:
+        resp = session.post(
+            url, params=params, data=post_data,
+            headers=_get_store_daily_stats_headers(), cookies=cookies, timeout=60
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+        if result.get('code') != 200:
+            print(f"   ❌ API返回错误: code={result.get('code')}, msg={result.get('msg')}")
+            return None
+
+        file_url = None
+        for item in result.get('data', []):
+            body = item.get('body', {}) or {}
+            if body.get('fileUrl'):
+                file_url = body['fileUrl']
+                break
+
+        if not file_url:
+            print(f"   ❌ 响应中未找到 fileUrl")
+            print(f"   响应: {json.dumps(result, ensure_ascii=False)[:300]}")
+            return None
+
+        print(f"   📥 下载文件...")
+        file_resp = session.get(file_url, timeout=120)
+        file_resp.raise_for_status()
+
+        df = pd.read_excel(BytesIO(file_resp.content), header=None)
+        print(f"   ✅ 下载成功，共 {len(df)} 行（含表头）")
+        return df
+
+    except Exception as e:
+        print(f"   ❌ 下载异常: {e}")
+        return None
+
+
+def _fetch_whereabouts(session: requests.Session, cookies: dict, mtgsig: str,
+                       shop_id: str, date_range: str) -> Dict[str, Dict[str, int]]:
+    """下载「页面用户行为数据」，提取 地址/电话/在线咨询 点击数
+    返回: {date_str: {'address': x, 'phone': x, 'online_consult': x}}
+    """
+    print(f"\n  📊 任务1-地址/电话/咨询 | 门店: {shop_id} | 日期: {date_range}")
+
+    post_data = {
+        'source': '1',
+        'device': 'pc',
+        'pageType': 'flowWhereabouts',
+        'shopIds': shop_id,
+        'platform': '0',
+        'date': date_range,
+    }
+
+    df = _download_excel_from_api(
+        session, cookies, mtgsig,
+        component_id='flowViewDataWhereaboutsDownload_async',
+        page_type='flowWhereabouts',
+        post_data=post_data
+    )
+
+    result = {}
+
+    if df is None or len(df) <= 1:
+        return result
+
+    TYPE_MAP = {
+        '地址':    'address',
+        '电话':    'phone',
+        '在线咨询': 'online_consult',
+    }
+
+    for idx in range(1, len(df)):
+        row = df.iloc[idx]
+        raw_date  = row.iloc[0]
+        type_name = str(row.iloc[3]).strip()
+        value     = safe_int_value(row.iloc[4])
+
+        if type_name not in TYPE_MAP:
+            continue
+
+        try:
+            if hasattr(raw_date, 'strftime'):
+                date_str = raw_date.strftime('%Y-%m-%d')
+            else:
+                date_str = str(raw_date).strip()[:10]
+        except:
+            continue
+
+        if date_str not in result:
+            result[date_str] = {}
+        result[date_str][TYPE_MAP[type_name]] = value
+
+    print(f"   ✅ 解析完成，共 {len(result)} 个日期")
+    return result
+
+
+def _fetch_flow_stats(session: requests.Session, cookies: dict, mtgsig: str,
+                      shop_id: str, date_range: str) -> Dict[str, Dict[str, int]]:
+    """下载「客流数据」，提取 新增收藏/新增打卡
+    返回: {date_str: {'new_favorite': x, 'new_checkin': x}}
+    """
+    print(f"\n  📊 任务2-打卡/收藏 | 门店: {shop_id} | 日期: {date_range}")
+
+    post_data = {
+        'source': '1',
+        'device': 'pc',
+        'pageType': 'flowAnalysis',
+        'shopIds': shop_id,
+        'platform': '0',
+        'date': date_range,
+    }
+
+    df = _download_excel_from_api(
+        session, cookies, mtgsig,
+        component_id='flowDataSummaryDownloadPCAsync',
+        page_type='flowAnalysis',
+        post_data=post_data
+    )
+
+    result = {}
+
+    if df is None or len(df) <= 1:
+        return result
+
+    for idx in range(1, len(df)):
+        row = df.iloc[idx]
+        raw_date = row.iloc[0]
+        new_fav  = safe_int_value(row.iloc[35])
+        new_chk  = safe_int_value(row.iloc[38])
+
+        try:
+            if hasattr(raw_date, 'strftime'):
+                date_str = raw_date.strftime('%Y-%m-%d')
+            else:
+                date_str = str(raw_date).strip()[:10]
+        except:
+            continue
+
+        result[date_str] = {
+            'new_favorite': new_fav,
+            'new_checkin': new_chk,
+        }
+
+    print(f"   ✅ 解析完成，共 {len(result)} 个日期")
+    return result
+
+
+def _fetch_review_stats(session: requests.Session, cookies: dict, mtgsig: str,
+                        date_range: str, dele_ids: set) -> Dict[tuple, int]:
+    """下载「评价数据」，提取各门店各日期新增评价数
+    返回: {(date_str, shop_id_str): new_review_count}
+    """
+    print(f"\n  📊 任务3-新增评价 | 日期: {date_range}")
+
+    post_data = {
+        'source': '1',
+        'device': 'pc',
+        'pageType': 'v5Home',
+        'sign': '',
+        'date': date_range,
+        'platform': '0',
+        'shopIds': '0',
+        'typeIds': '0',
+    }
+
+    df = _download_excel_from_api(
+        session, cookies, mtgsig,
+        component_id='reviewAnalysisV2PCDownload',
+        page_type='reviewAnalysisV2',
+        post_data=post_data
+    )
+
+    result = {}
+
+    if df is None or len(df) <= 1:
+        return result
+
+    for idx in range(1, len(df)):
+        row = df.iloc[idx]
+        raw_date = row.iloc[0]
+        shop_id  = str(row.iloc[4]).strip()
+        new_rev  = safe_int_value(row.iloc[6])
+
+        if shop_id in dele_ids:
+            continue
+
+        try:
+            if hasattr(raw_date, 'strftime'):
+                date_str = raw_date.strftime('%Y-%m-%d')
+            else:
+                date_str = str(raw_date).strip()[:10]
+        except:
+            continue
+
+        key = (date_str, shop_id)
+        result[key] = max(result.get(key, 0), new_rev)
+
+    print(f"   ✅ 解析完成，共 {len(result)} 条 (日期×门店)")
+    return result
+
+
+def _merge_store_daily_stats(
+    whereabouts_by_shop: Dict[str, Dict[str, Dict[str, int]]],
+    flow_by_shop: Dict[str, Dict[str, Dict[str, int]]],
+    review_data: Dict[tuple, int],
+) -> Dict[tuple, dict]:
+    """合并三份数据，以 (date, shop_id) 为 key"""
+    merged = {}
+
+    def ensure_key(date, shop_id):
+        k = (date, shop_id)
+        if k not in merged:
+            merged[k] = {}
+        return k
+
+    for shop_id, date_dict in whereabouts_by_shop.items():
+        for date_str, fields in date_dict.items():
+            k = ensure_key(date_str, shop_id)
+            merged[k].update(fields)
+
+    for shop_id, date_dict in flow_by_shop.items():
+        for date_str, fields in date_dict.items():
+            k = ensure_key(date_str, shop_id)
+            merged[k].update(fields)
+
+    for (date_str, shop_id), new_rev in review_data.items():
+        k = ensure_key(date_str, shop_id)
+        merged[k]['new_review'] = new_rev
+
+    return merged
+
+
+def _upload_store_daily_stats(merged: Dict[tuple, dict]) -> tuple:
+    """上传合并后的store_daily_stats数据到 upsert 接口"""
+    print(f"\n{'─' * 50}")
+    print(f"📤 [store_daily_stats] 开始上传数据，共 {len(merged)} 条 (日期×门店)")
+    print(f"{'─' * 50}")
+
+    session = get_session()
+    success_count = 0
+    fail_count = 0
+
+    for idx, ((date_str, shop_id), fields) in enumerate(merged.items(), 1):
+        payload = {
+            "data_date": date_str,
+            "store_id": shop_id,
+            **fields
+        }
+
+        print(f"\n  [{idx}/{len(merged)}] date={date_str}, shop={shop_id}")
+        print(f"     字段: {fields}")
+
+        try:
+            resp = session.post(
+                STORE_DAILY_STATS_UPSERT_API_URL,
+                headers={'Content-Type': 'application/json'},
+                json=payload,
+                timeout=30
+            )
+            print(f"     HTTP {resp.status_code}: {resp.text[:200]}")
+            if resp.status_code in [200, 201]:
+                success_count += 1
+                print(f"     ✅ 成功")
+            else:
+                fail_count += 1
+                print(f"     ❌ 失败")
+        except Exception as e:
+            fail_count += 1
+            print(f"     ❌ 异常: {e}")
+
+    return success_count, fail_count
+
+
+def _load_store_daily_stats_account(account_name: str) -> Optional[Dict[str, Any]]:
+    """从 kewenai.asia 获取账户的门店列表和dele_id"""
+    print(f"\n{'─' * 50}")
+    print(f"🔍 [store_daily_stats] 获取账户门店数据: {account_name}")
+
+    session = get_session()
+    try:
+        resp = session.post(
+            STORE_DAILY_STATS_ACCOUNT_API_URL,
+            headers={'Content-Type': 'application/json'},
+            json={"account": account_name},
+            timeout=30
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+        if not result.get('success'):
+            print(f"   ❌ 账户API返回失败: {result}")
+            return None
+
+        data = result.get('data', {})
+        if not data:
+            print(f"   ❌ 账户API返回data为空")
+            return None
+
+        stores_json = data.get('stores_json', [])
+        dele_id_str = data.get('dele_id', '') or ''
+        dele_ids = set(str(x).strip() for x in dele_id_str.split(',') if x.strip())
+
+        active_shops = [
+            shop for shop in stores_json
+            if str(shop.get('shop_id', '')).strip() not in dele_ids
+        ]
+
+        print(f"   ✅ 账户门店加载成功")
+        print(f"   全部门店: {len(stores_json)}")
+        print(f"   删除门店: {dele_ids}")
+        print(f"   有效门店: {len(active_shops)}")
+        for s in active_shops:
+            print(f"     - {s.get('shop_name')} ({s.get('shop_id')})")
+
+        return {
+            'active_shops': active_shops,
+            'dele_ids': dele_ids,
+        }
+
+    except Exception as e:
+        print(f"   ❌ 获取账户门店数据异常: {e}")
+        return None
+
+
+def run_store_daily_stats_collection(account_name: str, cookies: dict, mtgsig: str,
+                                     page=None) -> Dict[str, Any]:
+    """执行 store_daily_stats 完整采集流程（复用主系统浏览器）
+
+    在 run_all_tasks 中被调用，分为3个阶段：
+    - 阶段1+2（客流分析页面）：地址/电话/咨询 + 打卡/收藏
+    - 阶段3（评价分析页面）：新增评价
+    - 最后合并上传
+
+    Args:
+        account_name: 账户名
+        cookies: 当前有效的cookies
+        mtgsig: 当前有效的mtgsig签名
+        page: Playwright page对象（用于页面跳转）
+
+    Returns:
+        标准结果字典 {task_name, success, record_count, error_message}
+    """
+    print(f"\n{'=' * 60}")
+    print(f"📊 [store_daily_stats] 开始门店每日统计数据采集")
+    print(f"{'=' * 60}")
+
+    try:
+        # 1. 获取门店列表
+        account_data = _load_store_daily_stats_account(account_name)
+        if not account_data:
+            return {
+                "task_name": "store_daily_stats",
+                "success": False,
+                "record_count": 0,
+                "error_message": "获取账户门店数据失败"
+            }
+
+        active_shops = account_data['active_shops']
+        dele_ids = account_data['dele_ids']
+
+        if not active_shops:
+            return {
+                "task_name": "store_daily_stats",
+                "success": False,
+                "record_count": 0,
+                "error_message": "没有有效门店"
+            }
+
+        # 2. 计算近30天日期范围
+        today = datetime.now().date()
+        end_date = today - timedelta(days=1)
+        start_date = end_date - timedelta(days=29)
+        date_range = f"{start_date},{end_date}"
+        print(f"   📅 日期范围: {date_range}")
+
+        session = get_session()
+        whereabouts_by_shop = {}
+        flow_by_shop = {}
+        review_data = {}
+
+        # 3. 跳转到客流分析页面（任务1 + 任务2）
+        if page:
+            print(f"\n🔗 [store_daily_stats] 跳转到客流分析页面...")
+            try:
+                page.goto(TASK_PAGE_URLS["store_stats"], wait_until='networkidle', timeout=30000)
+                time.sleep(3)
+                print(f"   ✅ 页面已就绪")
+            except Exception as e:
+                print(f"   ⚠️ 页面跳转异常（继续执行）: {e}")
+
+        # 任务1：逐门店下载地址/电话/在线咨询
+        print(f"\n{'─' * 50}")
+        print(f"▶ [store_daily_stats] 任务1：地址/电话/在线咨询（共 {len(active_shops)} 个门店）")
+        print(f"{'─' * 50}")
+
+        for shop in active_shops:
+            shop_id = str(shop['shop_id'])
+            shop_name = shop['shop_name']
+            print(f"\n  🏪 门店: {shop_name} ({shop_id})")
+            try:
+                result = _fetch_whereabouts(session, cookies, mtgsig, shop_id, date_range)
+                whereabouts_by_shop[shop_id] = result
+            except Exception as e:
+                print(f"  ❌ 跳过，异常: {e}")
+                whereabouts_by_shop[shop_id] = {}
+            random_delay(2, 4)
+
+        # 任务2：逐门店下载打卡/收藏
+        print(f"\n{'─' * 50}")
+        print(f"▶ [store_daily_stats] 任务2：新增打卡/新增收藏（共 {len(active_shops)} 个门店）")
+        print(f"{'─' * 50}")
+
+        for shop in active_shops:
+            shop_id = str(shop['shop_id'])
+            shop_name = shop['shop_name']
+            print(f"\n  🏪 门店: {shop_name} ({shop_id})")
+            try:
+                result = _fetch_flow_stats(session, cookies, mtgsig, shop_id, date_range)
+                flow_by_shop[shop_id] = result
+            except Exception as e:
+                print(f"  ❌ 跳过，异常: {e}")
+                flow_by_shop[shop_id] = {}
+            random_delay(2, 4)
+
+        # 4. 跳转到评价分析页面（任务3）
+        if page:
+            print(f"\n🔗 [store_daily_stats] 跳转到评价分析页面...")
+            try:
+                page.goto(PAGE_REVIEW_ANALYSIS, wait_until='networkidle', timeout=30000)
+                time.sleep(3)
+                print(f"   ✅ 页面已就绪")
+            except Exception as e:
+                print(f"   ⚠️ 页面跳转异常（继续执行）: {e}")
+
+        # 任务3：一次性下载全量评价数据
+        print(f"\n{'─' * 50}")
+        print(f"▶ [store_daily_stats] 任务3：新增评价（全量，过滤删除门店）")
+        print(f"{'─' * 50}")
+
+        try:
+            review_data = _fetch_review_stats(session, cookies, mtgsig, date_range, dele_ids)
+        except Exception as e:
+            print(f"  ❌ 任务3失败，异常: {e}")
+            review_data = {}
+
+        # 5. 合并数据
+        print(f"\n{'─' * 50}")
+        print("📊 [store_daily_stats] 合并三份数据...")
+        merged = _merge_store_daily_stats(whereabouts_by_shop, flow_by_shop, review_data)
+        print(f"   合并后共 {len(merged)} 条 (日期×门店)")
+
+        # 6. 上传数据
+        if len(merged) == 0:
+            print("   ⚠️ 无数据可上传")
+            return {
+                "task_name": "store_daily_stats",
+                "success": True,
+                "record_count": 0,
+                "error_message": "无数据"
+            }
+
+        success_count, fail_count = _upload_store_daily_stats(merged)
+
+        # 7. 结果摘要
+        print(f"\n{'=' * 60}")
+        print(f"📊 [store_daily_stats] 执行摘要")
+        print(f"{'=' * 60}")
+        print(f"   有效门店: {len(active_shops)}")
+        print(f"   数据条数: {len(merged)}")
+        print(f"   上传成功: {success_count}")
+        print(f"   上传失败: {fail_count}")
+
+        if fail_count > 0:
+            return {
+                "task_name": "store_daily_stats",
+                "success": False,
+                "record_count": success_count,
+                "error_message": f"部分上传失败: 成功{success_count}, 失败{fail_count}"
+            }
+
+        return {
+            "task_name": "store_daily_stats",
+            "success": True,
+            "record_count": success_count,
+            "error_message": ""
+        }
+
+    except Exception as e:
+        error_msg = f"store_daily_stats采集异常: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "task_name": "store_daily_stats",
+            "success": False,
+            "record_count": 0,
+            "error_message": error_msg
+        }
 
 
 # ============================================================================
@@ -5689,6 +6249,13 @@ class PageDrivenTaskExecutor:
 
             task_func = TASK_MAP.get(task_name)
             if task_func:
+                # 报表任务使用近30天日期范围
+                if task_name in ('kewen_daily_report', 'promotion_daily_report'):
+                    end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+                    task_start_date = (end_dt - timedelta(days=29)).strftime('%Y-%m-%d')
+                else:
+                    task_start_date = start_date
+
                 # 所有任务都传递共享的 cookies, mtgsig, shop_info（避免重复调用API）
                 if task_name == 'store_stats':
                     result = task_func(
@@ -5702,14 +6269,14 @@ class PageDrivenTaskExecutor:
                     )
                 elif task_name == 'kewen_daily_report':
                     result = task_func(
-                        self.account_name, start_date, end_date,
+                        self.account_name, task_start_date, end_date,
                         templates_id=self.templates_id,
                         cookies=current_cookies,
                         mtgsig=current_mtgsig
                     )
                 elif task_name == 'promotion_daily_report':
                     result = task_func(
-                        self.account_name, start_date, end_date,
+                        self.account_name, task_start_date, end_date,
                         cookies=current_cookies,
                         mtgsig=current_mtgsig
                     )
@@ -5901,6 +6468,33 @@ class PageDrivenTaskExecutor:
 
                 # 页面间随机延迟
                 random_delay(3, 5)
+
+            # ========== 执行 store_daily_stats 采集（独立于7个主任务） ==========
+            if not self.login_invalid:
+                print(f"\n{'=' * 60}")
+                print("📊 开始执行 store_daily_stats 门店每日统计数据采集")
+                print(f"{'=' * 60}")
+
+                current_cookies = SHARED_SIGNATURE.get('cookies') or self.cookies
+                current_mtgsig = SHARED_SIGNATURE.get('mtgsig') or self.mtgsig
+
+                try:
+                    sds_result = run_store_daily_stats_collection(
+                        account_name=self.account_name,
+                        cookies=current_cookies,
+                        mtgsig=current_mtgsig,
+                        page=self.page
+                    )
+                    if sds_result.get('success'):
+                        print(f"✅ store_daily_stats 采集完成，记录数: {sds_result.get('record_count', 0)}")
+                    else:
+                        print(f"❌ store_daily_stats 采集失败: {sds_result.get('error_message', '未知错误')}")
+                except Exception as e:
+                    print(f"❌ store_daily_stats 采集异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"\n⚠️ 跳过 store_daily_stats（登录已失效）")
 
         except Exception as e:
             error_msg = str(e)
@@ -6277,6 +6871,14 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
         START_DATE = start_date
         END_DATE = end_date
 
+    # 报表任务使用近30天日期（昨天往前推29天，共30天）
+    if task in ['kewen_daily_report', 'promotion_daily_report']:
+        today = datetime.now()
+        end_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")  # 昨天
+        start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")  # 昨天往前29天
+        START_DATE = start_date
+        END_DATE = end_date
+
     print(f"\n{'=' * 80}")
     print("📌 任务配置")
     print(f"{'=' * 80}")
@@ -6409,6 +7011,13 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
             reset_task_schedule(task_id)
         else:
             report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        return False
+
+    # 检查结果是否为空（所有任务未执行，可能是登录失效或启动失败）
+    if len(results) == 0:
+        error_msg = "所有任务未执行（登录失效或启动失败）"
+        print(f"❌ {error_msg}")
+        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     print_summary(results)
