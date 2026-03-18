@@ -80,6 +80,27 @@ FATAL_KEYWORDS = [
 
 
 # ============================================================================
+# 工具函数
+# ============================================================================
+
+def get_public_ip():
+    """获取服务器公网IP"""
+    try:
+        resp = requests.get("https://ifconfig.me/ip", timeout=5)
+        if resp.status_code == 200:
+            return resp.text.strip()
+    except Exception:
+        pass
+    try:
+        resp = requests.get("https://api.ipify.org", timeout=5)
+        if resp.status_code == 200:
+            return resp.text.strip()
+    except Exception:
+        pass
+    return os.uname().nodename  # 兜底用主机名
+
+
+# ============================================================================
 # 健康检查项
 # ============================================================================
 
@@ -423,7 +444,7 @@ def run_all_checks():
     # 拍平为一级字段，平台 #{} 可直接取值
     report = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "hostname": os.uname().nodename,
+        "hostname": get_public_ip(),
         "service": PROCESS_NAME,
         "healthy": 1 if overall_healthy else 0,
         "status": "healthy" if overall_healthy else "unhealthy",
