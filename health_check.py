@@ -96,6 +96,13 @@ def get_public_ip():
             return resp.text.strip()
     except Exception:
         pass
+    # 火山引擎ECS元数据服务（内网可达，无需公网）
+    try:
+        resp = requests.get("http://100.96.0.96/latest/meta-data/public-ipv4", timeout=3)
+        if resp.status_code == 200 and resp.text.strip():
+            return resp.text.strip()
+    except Exception:
+        pass
     # 阿里云ECS元数据服务（内网可达，无需公网）
     try:
         resp = requests.get("http://100.100.100.200/latest/meta-data/eipv4", timeout=3)
