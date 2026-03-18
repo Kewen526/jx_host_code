@@ -75,7 +75,6 @@ ERROR_KEYWORDS = [
 FATAL_KEYWORDS = [
     "守护进程正常退出", "收到退出信号",
     "OAuth token has expired", "authentication_error",
-    "401",
 ]
 
 
@@ -448,7 +447,7 @@ def run_all_checks():
         "service": PROCESS_NAME,
         "healthy": 1 if overall_healthy else 0,
         "status": "healthy" if overall_healthy else "unhealthy",
-        "unhealthy_items": ",".join(unhealthy_items) if unhealthy_items else "",
+        "unhealthy_items": unhealthy_items,
         "summary": _build_summary(checks, overall_healthy),
         # 进程存活
         "process_alive": 1 if proc["healthy"] else 0,
@@ -465,7 +464,7 @@ def run_all_checks():
         "no_errors": 1 if errors["healthy"] else 0,
         "error_count": errors.get("error_count", 0),
         "fatal_count": errors.get("fatal_count", 0),
-        "recent_errors": json.dumps(errors.get("errors", []), ensure_ascii=False),
+        "recent_errors": errors.get("errors", []),
         # 系统资源
         "resources_ok": 1 if resources["healthy"] else 0,
         "disk_percent": resources.get("disk_percent") or 0,
