@@ -7116,7 +7116,10 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
     if len(results) == 0:
         error_msg = "所有任务未执行（登录失效或启动失败）"
         print(f"❌ {error_msg}")
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        # 上报cookie失效状态到platform_accounts
+        report_auth_invalid(account_name)
+        log_failure(account_name, 0, "all_tasks_not_executed", start_date, end_date, error_msg)
+        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=0)
         return False
 
     print_summary(results)
