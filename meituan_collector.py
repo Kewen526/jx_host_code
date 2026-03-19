@@ -2547,33 +2547,67 @@ def ensure_template_id_with_browser(account_name: str, cookies: dict,
 # ============================================================================
 # kewen_daily_report 任务
 # ============================================================================
-KEWEN_COLUMN_MAPPING = {
-    0: ("report_date", "string"), 1: ("province", "string"), 2: ("city", "string"),
-    3: ("shop_id", "number"), 4: ("shop_name", "string"), 5: ("dianping_star", "number"),
-    6: ("meituan_star", "number"), 7: ("operation_score", "number"), 8: ("operation_level", "string"),
-    9: ("promotion_cost", "number"), 10: ("merchant_cost", "number"), 11: ("platform_service_fee", "number"),
-    12: ("commission_gtv", "number"), 13: ("exposure_users", "number"), 14: ("exposure_count", "number"),
-    15: ("visit_users", "number"), 16: ("visit_count", "number"), 17: ("exposure_visit_rate", "string"),
-    18: ("order_users", "number"), 19: ("lead_users", "number"), 20: ("intent_users", "number"),
-    21: ("intent_rate", "string"), 22: ("new_collect_users", "number"), 23: ("total_collect_users", "number"),
-    24: ("avg_stay_seconds", "number"), 25: ("promotion_exposure_count", "number"), 26: ("promotion_click_count", "number"),
-    27: ("verify_sale_amount", "number"), 28: ("verify_after_discount", "number"), 29: ("verify_coupon_count", "number"),
-    30: ("verify_order_count", "number"), 31: ("verify_person_count", "number"), 32: ("verify_new_customer", "number"),
-    33: ("order_coupon_count", "number"), 34: ("order_sale_amount", "number"), 35: ("consult_users", "number"),
-    36: ("consult_lead_count", "number"), 37: ("consult_lead_rate", "string"), 38: ("avg_response_seconds", "number"),
-    39: ("reply_rate_30s", "string"), 40: ("reply_rate_5min", "string"), 41: ("refund_amount", "number"),
-    42: ("refund_order_count", "number"), 43: ("refund_users", "number"), 44: ("complaint_count", "number"),
-    45: ("compensation_order_count", "number"), 46: ("new_review_count", "number"), 47: ("new_good_review_count", "number"),
-    48: ("new_medium_review_count", "number"), 49: ("new_bad_review_count", "number"), 50: ("bad_review_reply_rate", "string"),
-    51: ("total_review_count", "number"), 52: ("total_bad_review_count", "number"),
-    # ============ 新增字段: 门店优惠码 (BB-BH列) ============
-    53: ("coupon_code_type", "string"),  # 码类型
-    54: ("coupon_pay_order_count", "number"),  # 支付订单数(个)
-    55: ("coupon_pay_amount", "number"),  # 支付金额(元)
-    56: ("coupon_verify_amount", "number"),  # 核销金额(元)
-    57: ("coupon_scan_users", "number"),  # 扫码人数(人)
-    58: ("coupon_scan_collect_count", "number"),  # 扫码收藏数(个)
-    59: ("coupon_scan_review_count", "number"),  # 扫码评价数(个)
+KEWEN_HEADER_MAPPING = {
+    "日期": ("report_date", "string"),
+    "省份": ("province", "string"),
+    "城市": ("city", "string"),
+    "点评门店ID": ("shop_id", "number"),
+    "门店名称": ("shop_name", "string"),
+    "点评星级": ("dianping_star", "number"),
+    "美团星级": ("meituan_star", "number"),
+    "经营评分得分": ("operation_score", "number"),
+    "经营评分牌级": ("operation_level", "string"),
+    "推广通消耗金额": ("promotion_cost", "number"),
+    "商户通发布额": ("merchant_cost", "number"),
+    "平台技术服务费": ("platform_service_fee", "number"),
+    "计佣GTV": ("commission_gtv", "number"),
+    "曝光人数": ("exposure_users", "number"),
+    "曝光次数": ("exposure_count", "number"),
+    "访问人数": ("visit_users", "number"),
+    "访问次数": ("visit_count", "number"),
+    "曝光访问转化率": ("exposure_visit_rate", "string"),
+    "下单人数": ("order_users", "number"),
+    "留资人数": ("lead_users", "number"),
+    "意向转化人数": ("intent_users", "number"),
+    "意向转化率": ("intent_rate", "string"),
+    "新增收藏人数": ("new_collect_users", "number"),
+    "累计收藏人数": ("total_collect_users", "number"),
+    "页面有效平均停留时长": ("avg_stay_seconds", "number"),
+    "推广通曝光次数": ("promotion_exposure_count", "number"),
+    "推广通点击次数": ("promotion_click_count", "number"),
+    "核销售价金额": ("verify_sale_amount", "number"),
+    "商家优惠后核销额": ("verify_after_discount", "number"),
+    "核销券数": ("verify_coupon_count", "number"),
+    "核销订单量": ("verify_order_count", "number"),
+    "核销人次": ("verify_person_count", "number"),
+    "核销新客人数": ("verify_new_customer", "number"),
+    "下单券数": ("order_coupon_count", "number"),
+    "下单售价金额": ("order_sale_amount", "number"),
+    "在线咨询人数": ("consult_users", "number"),
+    "在线咨询留资数": ("consult_lead_count", "number"),
+    "咨询留资转化率": ("consult_lead_rate", "string"),
+    "平均响应时长": ("avg_response_seconds", "number"),
+    "30秒内回复率": ("reply_rate_30s", "string"),
+    "5分钟内回复率": ("reply_rate_5min", "string"),
+    "退款售价金额": ("refund_amount", "number"),
+    "退款订单量": ("refund_order_count", "number"),
+    "退款人数": ("refund_users", "number"),
+    "消费纠纷投诉量": ("complaint_count", "number"),
+    "投诉赔付订单量": ("compensation_order_count", "number"),
+    "新增评价数": ("new_review_count", "number"),
+    "新增好评数": ("new_good_review_count", "number"),
+    "新增中评数": ("new_medium_review_count", "number"),
+    "新增差评数": ("new_bad_review_count", "number"),
+    "差评回复率": ("bad_review_reply_rate", "string"),
+    "累计评价数": ("total_review_count", "number"),
+    "累计差评数": ("total_bad_review_count", "number"),
+    "码类型": ("coupon_code_type", "string"),
+    "支付订单": ("coupon_pay_order_count", "number"),
+    "支付金额": ("coupon_pay_amount", "number"),
+    "核销金额": ("coupon_verify_amount", "number"),
+    "扫码人数": ("coupon_scan_users", "number"),
+    "扫码收藏数": ("coupon_scan_collect_count", "number"),
+    "扫码评价数": ("coupon_scan_review_count", "number"),
 }
 
 KEWEN_STRING_DEFAULTS = {
@@ -2606,10 +2640,73 @@ def kewen_convert_value(value, data_type, field_name):
     return value
 
 
-def kewen_parse_excel_row(row):
-    """解析Excel行数据"""
+def kewen_build_column_mapping(df):
+    """根据Excel第2行表头自动匹配列位置，兼容不同模板（60列/114列等）
+
+    Args:
+        df: pandas DataFrame，header=None方式读入的Excel
+
+    Returns:
+        (col_mapping, coupon_type_col) 元组
+        col_mapping: {列索引: (字段名, 数据类型)} 字典
+        coupon_type_col: 码类型列索引，找不到则为None
+    """
+    header_row = df.iloc[1]  # Excel第2行（详细表头）
+    # 按关键词长度降序排列，优先匹配最长关键词
+    sorted_keywords = sorted(KEWEN_HEADER_MAPPING.keys(), key=len, reverse=True)
+
+    # 第一步：对每列找到最长匹配的关键词
+    col_mapping = {}  # {列索引: (字段名, 数据类型, 关键词长度)}
+    for col_idx in range(len(header_row)):
+        cell_value = header_row.iloc[col_idx]
+        if cell_value is None or (isinstance(cell_value, float) and math.isnan(cell_value)):
+            continue
+        header_str = str(cell_value).strip()
+        if not header_str:
+            continue
+        # 找到该列匹配的最长关键词（sorted_keywords已按长度降序，第一个匹配的就是最长的）
+        for keyword in sorted_keywords:
+            if keyword in header_str:
+                field_name, data_type = KEWEN_HEADER_MAPPING[keyword]
+                col_mapping[col_idx] = (field_name, data_type, len(keyword))
+                break  # 最长优先，匹配到就停
+
+    # 第二步：去重——同一个字段名被多列匹配时，保留关键词更长的那列
+    field_best = {}  # {字段名: (列索引, 关键词长度)}
+    for col_idx, (field_name, data_type, kw_len) in col_mapping.items():
+        if field_name not in field_best or kw_len > field_best[field_name][1]:
+            field_best[field_name] = (col_idx, kw_len)
+
+    # 构建最终映射，只保留每个字段名的最佳列
+    best_cols = {v[0] for v in field_best.values()}
+    final_mapping = {}
+    coupon_type_col = None
+    for col_idx in sorted(col_mapping.keys()):
+        if col_idx in best_cols:
+            field_name, data_type, _ = col_mapping[col_idx]
+            if field_best[field_name][0] == col_idx:  # 确认是该字段的最佳列
+                final_mapping[col_idx] = (field_name, data_type)
+                if field_name == "coupon_code_type":
+                    coupon_type_col = col_idx
+
+    print(f"   表头匹配: 共{len(header_row)}列，成功匹配{len(final_mapping)}个字段")
+    if coupon_type_col is not None:
+        print(f"   码类型列: 第{coupon_type_col}列")
+    else:
+        print(f"   码类型列: 未找到，将跳过码类型过滤")
+
+    return final_mapping, coupon_type_col
+
+
+def kewen_parse_excel_row_dynamic(row, col_mapping):
+    """使用动态列映射解析Excel行数据
+
+    Args:
+        row: pandas Series，一行Excel数据
+        col_mapping: {列索引: (字段名, 数据类型)} 字典，由kewen_build_column_mapping生成
+    """
     data = {}
-    for col_idx, (field_name, data_type) in KEWEN_COLUMN_MAPPING.items():
+    for col_idx, (field_name, data_type) in col_mapping.items():
         if col_idx < len(row):
             value = row.iloc[col_idx]
             converted = kewen_convert_value(value, data_type, field_name)
@@ -2826,20 +2923,22 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
         print(f"\n📄 开始解析Excel文件")
         df = pd.read_excel(save_path, header=None)
         print(f"✅ 读取成功，共 {len(df)} 行，{len(df.columns)} 列")
+        col_mapping, coupon_type_col = kewen_build_column_mapping(df)
         data_list = []
         skip_count = 0
         coupon_type_skip_count = 0
         for idx in range(2, len(df)):
             row = df.iloc[idx]
-            data = kewen_parse_excel_row(row)
+            data = kewen_parse_excel_row_dynamic(row, col_mapping)
             # 检查是否为空行
             if kewen_is_empty_row(data):
                 skip_count += 1
                 continue
-            # 检查优惠码类型，只保留"全部码"
-            if not kewen_is_valid_coupon_type(data):
-                coupon_type_skip_count += 1
-                continue
+            # 只在找到码类型列时做过滤，否则跳过过滤保留所有非空行
+            if coupon_type_col is not None:
+                if not kewen_is_valid_coupon_type(data):
+                    coupon_type_skip_count += 1
+                    continue
             data_list.append(data)
         print(f"✅ 解析完成:")
         print(f"   有效数据: {len(data_list)} 条 (全部码)")
