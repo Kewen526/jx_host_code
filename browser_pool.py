@@ -2077,9 +2077,14 @@ class KeepaliveService:
     使用方式：在主循环的空闲时间调用 perform_keepalive_batch()
     """
 
-    def __init__(self, pool: BrowserPoolManager):
+    # 账号同步检查间隔（秒）：30分钟
+    ACCOUNT_SYNC_INTERVAL = 30 * 60
+
+    def __init__(self, pool: BrowserPoolManager, server_ip: str = None):
         self.pool = pool
+        self.server_ip = server_ip
         self._last_full_cycle_time: Optional[datetime] = None
+        self._last_account_sync_time: Optional[datetime] = None  # 上次账号同步时间
         self._fail_cooldown: Dict[str, datetime] = {}  # 失败账号冷却记录
 
     def start(self):
@@ -2139,6 +2144,78 @@ class KeepaliveService:
 
         return [account_id for account_id, _ in accounts_to_keepalive]
 
+    def sync_accounts_from_server(self):
+        """从服务器同步账号到浏览器池，补全缺失的账号
+
+        每隔 ACCOUNT_SYNC_INTERVAL 检查一次，确保浏览器池中包含服务器分配的所有账号。
+        对于缺失的账号，获取其Cookie并创建Context加入浏览器池。
+        """
+        if not self.server_ip:
+            return
+
+        # 检查是否到了同步时间
+        now = datetime.now()
+        if self._last_account_sync_time is not None:
+            elapsed = (now - self._last_account_sync_time).total_seconds()
+            if elapsed < self.ACCOUNT_SYNC_INTERVAL:
+                return
+
+        self._last_account_sync_time = now
+
+        try:
+            # 1. 从API获取服务器应有的全量账号
+            all_accounts = fetch_accounts_by_host(self.server_ip)
+            if not all_accounts:
+                log_warn("账号同步: 未获取到任何账号，跳过同步")
+                return
+
+            # 2. 获取浏览器池中已有的账号
+            pool_accounts = set(self.pool.get_all_account_ids())
+
+            # 3. 找出缺失的账号
+            missing_accounts = [acc for acc in all_accounts if acc not in pool_accounts]
+
+            if not missing_accounts:
+                log_info(f"账号同步: 浏览器池账号完整（{len(pool_accounts)}/{len(all_accounts)}），无需补全")
+                return
+
+            log_info(f"账号同步: 发现 {len(missing_accounts)} 个缺失账号，开始补全 "
+                     f"(池中 {len(pool_accounts)}/{len(all_accounts)})")
+
+            # 4. 补全缺失账号
+            success_count = 0
+            for account_id in missing_accounts:
+                # 资源检查，资源紧张时停止补全
+                if not resource_monitor.is_safe_for_keepalive():
+                    log_warn(f"账号同步: 资源紧张，暂停补全（已补全 {success_count}/{len(missing_accounts)}）")
+                    break
+
+                try:
+                    # 从API获取该账号的Cookie
+                    cookies = fetch_account_cookie(account_id)
+                    if not cookies:
+                        log_warn(f"账号同步: {account_id} 无法获取Cookie，跳过")
+                        continue
+
+                    # 创建Context加入浏览器池
+                    wrapper = self.pool.get_context(account_id, cookies)
+                    if wrapper:
+                        success_count += 1
+                        log_info(f"账号同步: {account_id} 已补全到浏览器池")
+                    else:
+                        log_warn(f"账号同步: {account_id} 创建Context失败")
+
+                except Exception as e:
+                    log_warn(f"账号同步: {account_id} 补全异常: {e}")
+
+                # 短暂等待，避免过快创建
+                time.sleep(1)
+
+            log_info(f"账号同步完成: 补全 {success_count}/{len(missing_accounts)} 个账号")
+
+        except Exception as e:
+            log_error(f"账号同步异常: {e}", error=e, context="KeepaliveService.sync_accounts_from_server")
+
     def perform_keepalive_batch(self) -> int:
         """执行一批保活操作（同步，必须在主线程调用）
 
@@ -2148,6 +2225,12 @@ class KeepaliveService:
         Returns:
             int: 成功保活的账号数，-1 表示因资源问题跳过
         """
+        # ===== 账号同步检查（定期补全缺失账号） =====
+        try:
+            self.sync_accounts_from_server()
+        except Exception as e:
+            log_warn(f"账号同步检查异常: {e}")
+
         # ===== 资源检查 =====
         if not resource_monitor.is_safe_for_keepalive():
             resource_monitor.print_status()
@@ -2462,106 +2545,15 @@ def initialize_browser_pool(headless: bool = True) -> BrowserPoolManager:
     return browser_pool
 
 
-def run_full_review_reply_cycle(pool: BrowserPoolManager, server_ip: str) -> Dict[str, int]:
-    """全量账号评论回复周期
 
-    通过 getAccountsByHost API 获取当前服务器的所有账号，
-    串行遍历每个账号执行评论回复。
-    对于浏览器池中没有 Context 的账号，会临时创建 Context，用完释放。
+def start_keepalive_service(pool: BrowserPoolManager, server_ip: str = None) -> KeepaliveService:
+    """启动保活服务
 
     Args:
         pool: 浏览器池管理器
-        server_ip: 服务器公网IP
-
-    Returns:
-        统计信息 {"total_accounts": 总账号数, "processed": 已处理数, "review_success": 回复成功数, "review_failed": 回复失败数}
+        server_ip: 服务器公网IP，用于定期同步账号列表
     """
-    stats = {"total_accounts": 0, "processed": 0, "review_success": 0, "review_failed": 0}
-
-    if not REVIEW_REPLY_AVAILABLE:
-        log_warn("评价回复模块不可用，跳过全量评论回复")
-        return stats
-
-    if not server_ip:
-        log_warn("服务器IP为空，无法获取账号列表")
-        return stats
-
-    # 1. 获取全量账号列表
-    all_accounts = fetch_accounts_by_host(server_ip)
-    if not all_accounts:
-        log_warn("未获取到任何账号，跳过全量评论回复")
-        return stats
-
-    stats["total_accounts"] = len(all_accounts)
-    log_info(f"开始全量评论回复周期，共 {len(all_accounts)} 个账号")
-
-    # 2. 串行遍历每个账号
-    for i, account_id in enumerate(all_accounts):
-        try:
-            log_info(f"[{i + 1}/{len(all_accounts)}] 处理账号: {account_id}")
-
-            cookies = None
-            had_existing_context = pool.has_context(account_id)
-            created_new_context = False
-
-            # 检查浏览器池是否有该账号的 Context
-            if had_existing_context:
-                # 复用已有 Context，从中获取 cookies
-                wrapper = pool._contexts.get(account_id)
-                if wrapper:
-                    try:
-                        cookies = wrapper.get_cookies()
-                    except Exception as e:
-                        log_warn(f"{account_id} 从已有Context获取cookies失败: {e}")
-
-            if not cookies:
-                # 从API获取cookies
-                cookies = fetch_account_cookie(account_id)
-                if not cookies:
-                    log_warn(f"{account_id} 无法获取cookies，跳过")
-                    continue
-
-                # 如果本来就没有Context，尝试创建临时Context
-                if not had_existing_context:
-                    try:
-                        wrapper = pool.get_context(account_id, cookies)
-                        if wrapper:
-                            created_new_context = True
-                        else:
-                            log_warn(f"{account_id} 创建临时Context失败，使用API cookies直接执行评论回复")
-                    except Exception as e:
-                        log_warn(f"{account_id} 创建临时Context异常: {e}，使用API cookies直接执行评论回复")
-
-            # 3. 执行评论回复（process_review_replies 使用 HTTP 请求，不需要浏览器）
-            result = process_review_replies(account_id, cookies)
-            stats["processed"] += 1
-            stats["review_success"] += result.get("success", 0)
-            stats["review_failed"] += result.get("failed", 0)
-
-            # 4. 如果是新创建的临时 Context，用完释放
-            if created_new_context:
-                try:
-                    pool.remove_context(account_id)
-                    log_info(f"{account_id} 临时Context已释放")
-                except Exception as e:
-                    log_warn(f"{account_id} 释放临时Context失败: {e}")
-
-            # 短暂等待，避免请求过于密集
-            time.sleep(1)
-
-        except Exception as e:
-            log_error(f"{account_id} 评论回复处理异常: {e}")
-            continue
-
-    log_info(f"全量评论回复周期完成: 总账号 {stats['total_accounts']}, "
-             f"已处理 {stats['processed']}, "
-             f"回复成功 {stats['review_success']}, 回复失败 {stats['review_failed']}")
-    return stats
-
-
-def start_keepalive_service(pool: BrowserPoolManager) -> KeepaliveService:
-    """启动保活服务"""
-    service = KeepaliveService(pool)
+    service = KeepaliveService(pool, server_ip=server_ip)
     service.start()
     return service
 
