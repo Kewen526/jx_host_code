@@ -70,7 +70,7 @@ MAX_ACTIVE_CONTEXTS = 10             # 最大活跃Context数量
 CONTEXT_IDLE_TIMEOUT = 30 * 60       # Context空闲超时（秒）：30分钟
 
 # 浏览器重启配置
-BROWSER_RESTART_HOUR = 14            # 每天重启时间（14点，任务少的时候）
+BROWSER_RESTART_HOUR = 3             # 每天重启时间（凌晨3点）
 BROWSER_MAX_RESTART_RETRIES = 3      # 重启失败最大重试次数
 
 # Playwright driver 自愈配置
@@ -93,6 +93,7 @@ PLATFORM_ACCOUNTS_API = f"{API_BASE_URL}/api/platform-accounts"
 GET_TASK_API = f"{API_BASE_URL}/api/get_task"
 ERROR_LOG_API = f"{API_BASE_URL}/api/log"
 GET_SINGLE_ACCOUNT_API = f"{API_BASE_URL}/api/get_platform_account"  # 获取单个账号Cookie
+GET_ACCOUNTS_BY_HOST_API = "https://kewenai.asia/api/servers/getAccountsByHost"  # 获取服务器分配的全量账号
 
 # 获取公网IP的服务列表（按优先级）
 PUBLIC_IP_SERVICES = [
@@ -688,6 +689,45 @@ def fetch_account_cookie(account_id: str) -> Optional[Dict]:
     except Exception as e:
         log_warn(f"获取 {account_id} Cookie异常: {e}")
         return None
+
+
+def fetch_accounts_by_host(server_ip: str) -> List[str]:
+    """通过服务器IP获取分配的全量账号列表
+
+    调用 /api/servers/getAccountsByHost 获取当前服务器的所有账号
+
+    Args:
+        server_ip: 服务器公网IP
+
+    Returns:
+        账号列表，失败返回空列表
+    """
+    try:
+        response = requests.post(
+            GET_ACCOUNTS_BY_HOST_API,
+            headers={'Content-Type': 'application/json'},
+            json={"server_host": server_ip},
+            timeout=30,
+            proxies={'http': None, 'https': None}
+        )
+
+        if response.status_code != 200:
+            log_warn(f"获取服务器账号列表失败，HTTP状态码: {response.status_code}")
+            return []
+
+        result = response.json()
+        if not result.get('success'):
+            log_warn(f"获取服务器账号列表失败: {result.get('message', '未知错误')}")
+            return []
+
+        data = result.get('data', [])
+        accounts = [item.get('account') for item in data if item.get('account')]
+        log_info(f"获取服务器 {server_ip} 的账号列表: {len(accounts)} 个")
+        return accounts
+
+    except Exception as e:
+        log_warn(f"获取服务器账号列表异常: {e}")
+        return []
 
 
 def upload_cookie_sync(account_id: str, cookies: Dict) -> bool:
@@ -2420,6 +2460,103 @@ def initialize_browser_pool(headless: bool = True) -> BrowserPoolManager:
     cookie_upload_queue.start()
 
     return browser_pool
+
+
+def run_full_review_reply_cycle(pool: BrowserPoolManager, server_ip: str) -> Dict[str, int]:
+    """全量账号评论回复周期
+
+    通过 getAccountsByHost API 获取当前服务器的所有账号，
+    串行遍历每个账号执行评论回复。
+    对于浏览器池中没有 Context 的账号，会临时创建 Context，用完释放。
+
+    Args:
+        pool: 浏览器池管理器
+        server_ip: 服务器公网IP
+
+    Returns:
+        统计信息 {"total_accounts": 总账号数, "processed": 已处理数, "review_success": 回复成功数, "review_failed": 回复失败数}
+    """
+    stats = {"total_accounts": 0, "processed": 0, "review_success": 0, "review_failed": 0}
+
+    if not REVIEW_REPLY_AVAILABLE:
+        log_warn("评价回复模块不可用，跳过全量评论回复")
+        return stats
+
+    if not server_ip:
+        log_warn("服务器IP为空，无法获取账号列表")
+        return stats
+
+    # 1. 获取全量账号列表
+    all_accounts = fetch_accounts_by_host(server_ip)
+    if not all_accounts:
+        log_warn("未获取到任何账号，跳过全量评论回复")
+        return stats
+
+    stats["total_accounts"] = len(all_accounts)
+    log_info(f"开始全量评论回复周期，共 {len(all_accounts)} 个账号")
+
+    # 2. 串行遍历每个账号
+    for i, account_id in enumerate(all_accounts):
+        try:
+            log_info(f"[{i + 1}/{len(all_accounts)}] 处理账号: {account_id}")
+
+            cookies = None
+            had_existing_context = pool.has_context(account_id)
+            created_new_context = False
+
+            # 检查浏览器池是否有该账号的 Context
+            if had_existing_context:
+                # 复用已有 Context，从中获取 cookies
+                wrapper = pool._contexts.get(account_id)
+                if wrapper:
+                    try:
+                        cookies = wrapper.get_cookies()
+                    except Exception as e:
+                        log_warn(f"{account_id} 从已有Context获取cookies失败: {e}")
+
+            if not cookies:
+                # 从API获取cookies
+                cookies = fetch_account_cookie(account_id)
+                if not cookies:
+                    log_warn(f"{account_id} 无法获取cookies，跳过")
+                    continue
+
+                # 如果本来就没有Context，尝试创建临时Context
+                if not had_existing_context:
+                    try:
+                        wrapper = pool.get_context(account_id, cookies)
+                        if wrapper:
+                            created_new_context = True
+                        else:
+                            log_warn(f"{account_id} 创建临时Context失败，使用API cookies直接执行评论回复")
+                    except Exception as e:
+                        log_warn(f"{account_id} 创建临时Context异常: {e}，使用API cookies直接执行评论回复")
+
+            # 3. 执行评论回复（process_review_replies 使用 HTTP 请求，不需要浏览器）
+            result = process_review_replies(account_id, cookies)
+            stats["processed"] += 1
+            stats["review_success"] += result.get("success", 0)
+            stats["review_failed"] += result.get("failed", 0)
+
+            # 4. 如果是新创建的临时 Context，用完释放
+            if created_new_context:
+                try:
+                    pool.remove_context(account_id)
+                    log_info(f"{account_id} 临时Context已释放")
+                except Exception as e:
+                    log_warn(f"{account_id} 释放临时Context失败: {e}")
+
+            # 短暂等待，避免请求过于密集
+            time.sleep(1)
+
+        except Exception as e:
+            log_error(f"{account_id} 评论回复处理异常: {e}")
+            continue
+
+    log_info(f"全量评论回复周期完成: 总账号 {stats['total_accounts']}, "
+             f"已处理 {stats['processed']}, "
+             f"回复成功 {stats['review_success']}, 回复失败 {stats['review_failed']}")
+    return stats
 
 
 def start_keepalive_service(pool: BrowserPoolManager) -> KeepaliveService:
