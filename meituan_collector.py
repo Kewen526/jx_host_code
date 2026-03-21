@@ -49,6 +49,8 @@ try:
         BrowserPoolManager,
         KeepaliveService,
         resource_monitor,  # 资源监控器
+        run_full_review_reply_cycle,  # 全量账号评论回复
+        fetch_accounts_by_host,  # 获取服务器全量账号
     )
     BROWSER_POOL_AVAILABLE = True
 except ImportError as e:
@@ -7262,6 +7264,12 @@ def main():
     success_tasks = 0
     failed_tasks = 0
 
+    # 全量评论回复控制变量
+    _all_tasks_done_review_executed = False   # 任务完成后的评论回复是否已执行
+    _review_reply_20_done_today = None        # 晚上8点评论回复执行的日期（防止同一天重复执行）
+    _had_task_today = False                   # 今天是否执行过任务（用于判断"任务全部完成"）
+    _consecutive_no_task_count = 0            # 连续无任务计数（连续2次无任务视为全部完成）
+
     print("\n🚀 开始守护进程循环...")
     print("   按 Ctrl+C 可优雅退出\n")
 
@@ -7283,6 +7291,15 @@ def main():
                         break  # 收到退出信号
                     continue
 
+                # ========== Step 1.5: 新一天重置评论回复控制变量 ==========
+                _today_date = datetime.now().strftime("%Y-%m-%d")
+                if _review_reply_20_done_today is not None and _review_reply_20_done_today != _today_date:
+                    # 跨天了，重置所有日级控制变量
+                    _all_tasks_done_review_executed = False
+                    _had_task_today = False
+                    _consecutive_no_task_count = 0
+                    print(f"📅 新的一天 ({_today_date})，重置评论回复控制变量")
+
                 # ========== Step 2: 生成任务调度 ==========
                 create_task_schedule()
                 time.sleep(5)
@@ -7295,8 +7312,25 @@ def main():
                     task_info = fetch_task()
 
                 if not task_info:
-                    print(f"\n⏳ 暂无待执行任务，{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
+                    _consecutive_no_task_count += 1
+                    print(f"\n⏳ 暂无待执行任务（连续第{_consecutive_no_task_count}次），{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
                     reschedule_failed_tasks()
+
+                    # ===== 任务全部完成后，立即执行全量评论回复（第一次） =====
+                    if (browser_pool_instance and server_ip
+                            and _had_task_today
+                            and not _all_tasks_done_review_executed
+                            and _consecutive_no_task_count >= 2):
+                        print("\n" + "=" * 60)
+                        print("📝 所有任务已完成，开始执行全量账号评论回复（第一次）...")
+                        print("=" * 60)
+                        try:
+                            run_full_review_reply_cycle(browser_pool_instance, server_ip)
+                        except Exception as e:
+                            print(f"   ❌ 全量评论回复异常: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        _all_tasks_done_review_executed = True
 
                     # 在等待期间执行保活（同步模式 + 资源保护）
                     if keepalive_service and browser_pool_instance:
@@ -7313,6 +7347,26 @@ def main():
 
                             if not _daemon_running or remaining_wait <= 0:
                                 break
+
+                            # ===== 晚上8点全量评论回复检查（第二次） =====
+                            try:
+                                now_check = datetime.now()
+                                today_str = now_check.strftime("%Y-%m-%d")
+                                if (now_check.hour >= 20
+                                        and _review_reply_20_done_today != today_str
+                                        and server_ip):
+                                    print("\n" + "=" * 60)
+                                    print("📝 到达晚上8点，开始执行全量账号评论回复（第二次）...")
+                                    print("=" * 60)
+                                    try:
+                                        run_full_review_reply_cycle(browser_pool_instance, server_ip)
+                                    except Exception as e:
+                                        print(f"   ❌ 全量评论回复异常: {e}")
+                                        import traceback
+                                        traceback.print_exc()
+                                    _review_reply_20_done_today = today_str
+                            except Exception as e:
+                                print(f"   ⚠️ 晚8点评论回复检查异常: {e}")
 
                             # ===== 资源检查与自动调节 =====
                             try:
@@ -7352,6 +7406,13 @@ def main():
                     continue
 
                 # ========== Step 4: 执行任务 ==========
+                # 有任务时重置连续无任务计数，标记今天有任务
+                _consecutive_no_task_count = 0
+                _had_task_today = True
+                # 如果之前已执行过任务完成后的评论回复，但又有新任务进来，重置标记
+                # 这样新一批任务完成后会再次触发评论回复
+                if _all_tasks_done_review_executed:
+                    _all_tasks_done_review_executed = False
 
                 # 资源检查（任务执行前）
                 if browser_pool_instance and BROWSER_POOL_AVAILABLE:
