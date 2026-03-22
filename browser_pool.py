@@ -674,6 +674,12 @@ def fetch_account_cookie(account_id: str) -> Optional[Dict]:
         if not record:
             return None
 
+        # 检查auth_status，如果已失效则不返回Cookie（避免为失效账号创建Context）
+        auth_status = record.get('auth_status')
+        if auth_status == 'invalid':
+            log_info(f"{account_id} auth_status=invalid，跳过Cookie获取")
+            return None
+
         # 解析cookie字段
         cookie_data = record.get('cookie')
         if isinstance(cookie_data, str):
@@ -1456,21 +1462,29 @@ class BrowserPoolManager:
         with self._lock:
             return account_id in self._contexts
 
-    def remove_context(self, account_id: str):
-        """移除账号的Context（安全处理异常）"""
+    def remove_context(self, account_id: str, skip_cookie_upload: bool = False):
+        """移除账号的Context（安全处理异常）
+
+        Args:
+            account_id: 账号ID
+            skip_cookie_upload: 是否跳过Cookie上传（登录失效时应为True，避免覆盖auth_status）
+        """
         with self._lock:
             if account_id in self._contexts:
                 wrapper = self._contexts[account_id]
                 browser_index = wrapper.browser_index
 
-                # 【方案A】移除前先保存Cookie
-                try:
-                    cookies = wrapper.get_cookies()
-                    if cookies:
-                        upload_cookie_sync(account_id, cookies)
-                        log_info(f"移除前已保存Cookie: {account_id}")
-                except Exception:
-                    pass  # 忽略获取Cookie失败
+                # 【方案A】移除前先保存Cookie（登录失效时跳过，避免覆盖auth_status=invalid）
+                if skip_cookie_upload:
+                    log_info(f"跳过Cookie上传（登录已失效）: {account_id}")
+                else:
+                    try:
+                        cookies = wrapper.get_cookies()
+                        if cookies:
+                            upload_cookie_sync(account_id, cookies)
+                            log_info(f"移除前已保存Cookie: {account_id}")
+                    except Exception:
+                        pass  # 忽略获取Cookie失败
 
                 # 安全关闭 wrapper（忽略错误）
                 try:
@@ -2378,6 +2392,8 @@ class KeepaliveService:
             if 'login' in current_url.lower():
                 log_warn(f"{account_id} Cookie已失效，上报失效状态")
                 self._report_cookie_invalid(account_id)
+                # 移除失效的Context（跳过Cookie上传，避免覆盖auth_status=invalid）
+                self.pool.remove_context(account_id, skip_cookie_upload=True)
                 self._set_cooldown(account_id)
                 return False
 
