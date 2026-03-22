@@ -5984,8 +5984,8 @@ class PageDrivenTaskExecutor:
                     return True
                 else:
                     print(f"❌ 重新登录失败: {status}")
-                    # 移除失败的Context
-                    self.browser_pool.remove_context(self.account_name)
+                    # 移除失败的Context（跳过Cookie上传，避免覆盖auth_status）
+                    self.browser_pool.remove_context(self.account_name, skip_cookie_upload=True)
                     return False
 
             # ========== 传统模式 ==========
@@ -6090,8 +6090,8 @@ class PageDrivenTaskExecutor:
                     return
                 else:
                     print(f"   ⚠️ 池中Context登录已失效，需要刷新Cookie")
-                    # 移除失效的Context
-                    self.browser_pool.remove_context(self.account_name)
+                    # 移除失效的Context（跳过Cookie上传，避免覆盖auth_status）
+                    self.browser_pool.remove_context(self.account_name, skip_cookie_upload=True)
 
             # 从池中创建新Context
             print(f"   正在为账号 {self.account_name} 创建新Context...")
@@ -6111,7 +6111,8 @@ class PageDrivenTaskExecutor:
             if not is_logged_in:
                 if status == "not_logged_in":
                     report_auth_invalid(self.account_name)
-                    self.browser_pool.remove_context(self.account_name)
+                    self.login_invalid = True
+                    self.browser_pool.remove_context(self.account_name, skip_cookie_upload=True)
                     raise AuthInvalidError("Cookie登录失败，账户登录状态已失效")
                 elif status == "timeout":
                     raise Exception("登录检测超时，请检查网络连接后重试")
@@ -7109,6 +7110,10 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
             print("⚠️ 检测到 Context 被关闭（非业务失败），归还任务到队列，不计重试次数")
             reset_task_schedule(task_id)
         else:
+            # 检查异常是否包含登录失效关键词，确保auth_status被正确更新
+            error_str = str(e)
+            if "登录失败" in error_str or "Cookie登录失败" in error_str or "登录失效" in error_str:
+                report_auth_invalid(account_name)
             report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
