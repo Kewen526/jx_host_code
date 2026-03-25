@@ -1997,8 +1997,9 @@ class BrowserPoolManager:
     def emergency_release(self) -> int:
         """紧急释放资源（资源危险时调用）
 
-        释放一半的Context来降低资源占用
-        同时清理失效的浏览器
+        释放一半的**可释放**Context来降低资源占用。
+        正在执行任务的Context（已加锁）会被跳过，避免杀死正在运行的任务。
+        同时清理失效的浏览器。
 
         Returns:
             int: 释放的Context数量
@@ -2020,12 +2021,26 @@ class BrowserPoolManager:
             if current_count == 0:
                 return 0
 
-            # 释放一半
-            to_release = max(1, current_count // 2)
+            # 过滤掉正在执行任务的Context（已加锁的账号不可释放）
+            releasable = [
+                (aid, w) for aid, w in self._contexts.items()
+                if not account_lock_manager.is_locked(aid)
+            ]
+            locked_count = current_count - len(releasable)
+
+            if not releasable:
+                log_warn(f"紧急释放: 所有 {current_count} 个Context都在执行任务，无法释放，等待任务完成")
+                return 0
+
+            if locked_count > 0:
+                log_info(f"紧急释放: 跳过 {locked_count} 个正在执行任务的Context")
+
+            # 释放一半的可释放Context
+            to_release = max(1, len(releasable) // 2)
 
             # 按最后使用时间排序（最久未使用的优先）
             sorted_accounts = sorted(
-                self._contexts.items(),
+                releasable,
                 key=lambda x: x[1].last_used_at
             )
 
@@ -2034,7 +2049,7 @@ class BrowserPoolManager:
                 try:
                     browser_index = wrapper.browser_index
 
-                    # 【方案A】释放前先上传Cookie到服务器，确保不丢失
+                    # 释放前先上传Cookie到服务器，确保不丢失
                     try:
                         cookies = wrapper.get_cookies()
                         if cookies:
@@ -2057,7 +2072,7 @@ class BrowserPoolManager:
                 except Exception as e:
                     log_warn(f"释放 {account_id} 失败: {e}")
 
-            log_info(f"紧急释放完成: {released}/{to_release}（剩余 {len(self._contexts)} 个）")
+            log_info(f"紧急释放完成: {released}/{to_release}（跳过{locked_count}个执行中，剩余 {len(self._contexts)} 个）")
             return released
 
 
@@ -2100,6 +2115,7 @@ class KeepaliveService:
         self._last_full_cycle_time: Optional[datetime] = None
         self._last_account_sync_time: Optional[datetime] = None  # 上次账号同步时间
         self._fail_cooldown: Dict[str, datetime] = {}  # 失败账号冷却记录
+        self._pending_sync_accounts: list = []  # 待渐进式补全的缺失账号列表
 
     def start(self):
         """启动保活服务（同步模式下仅打印提示）"""
@@ -2159,91 +2175,119 @@ class KeepaliveService:
         return [account_id for account_id, _ in accounts_to_keepalive]
 
     def sync_accounts_from_server(self):
-        """从服务器同步账号到浏览器池，补全缺失的账号
+        """从服务器同步账号到浏览器池，渐进式补全缺失的账号
 
-        每隔 ACCOUNT_SYNC_INTERVAL 检查一次，确保浏览器池中包含服务器分配的所有账号。
-        对于缺失的账号，获取其Cookie并创建Context加入浏览器池。
+        每隔 ACCOUNT_SYNC_INTERVAL 重新拉取全量账号列表。
+        每次调用最多创建 KEEPALIVE_BATCH_SIZE 个Context（渐进式），
+        避免一次性创建大量Context导致内存尖峰。
+        缺失列表在多次调用间保留，逐步补全。
         """
         if not self.server_ip:
             return
 
-        # 检查是否到了同步时间
         now = datetime.now()
-        if self._last_account_sync_time is not None:
-            elapsed = (now - self._last_account_sync_time).total_seconds()
-            if elapsed < self.ACCOUNT_SYNC_INTERVAL:
+
+        # 定期刷新缺失账号列表（首次 + 每30分钟）
+        need_refresh = (
+            self._last_account_sync_time is None
+            or (now - self._last_account_sync_time).total_seconds() >= self.ACCOUNT_SYNC_INTERVAL
+        )
+
+        if need_refresh:
+            self._last_account_sync_time = now
+            try:
+                # 1. 从API获取服务器应有的全量账号
+                all_accounts = fetch_accounts_by_host(self.server_ip)
+                if not all_accounts:
+                    log_warn("账号同步: 未获取到任何账号，跳过同步")
+                    self._pending_sync_accounts = []
+                    return
+
+                # 2. 获取浏览器池中已有的账号
+                pool_accounts = set(self.pool.get_all_account_ids())
+
+                # 3. 找出缺失的账号，保存到待同步列表
+                self._pending_sync_accounts = [acc for acc in all_accounts if acc not in pool_accounts]
+
+                if not self._pending_sync_accounts:
+                    log_info(f"账号同步: 浏览器池账号完整（{len(pool_accounts)}/{len(all_accounts)}），无需补全")
+                    return
+
+                log_info(f"账号同步: 发现 {len(self._pending_sync_accounts)} 个缺失账号，将渐进式补全 "
+                         f"(池中 {len(pool_accounts)}/{len(all_accounts)})")
+
+            except Exception as e:
+                log_error(f"账号同步异常: {e}", error=e, context="KeepaliveService.sync_accounts_from_server")
                 return
 
-        self._last_account_sync_time = now
+        # 没有待补全的账号
+        if not getattr(self, '_pending_sync_accounts', None):
+            return
 
-        try:
-            # 1. 从API获取服务器应有的全量账号
-            all_accounts = fetch_accounts_by_host(self.server_ip)
-            if not all_accounts:
-                log_warn("账号同步: 未获取到任何账号，跳过同步")
-                return
+        # 渐进式补全：每次最多创建 KEEPALIVE_BATCH_SIZE 个
+        batch = self._pending_sync_accounts[:KEEPALIVE_BATCH_SIZE]
+        success_count = 0
 
-            # 2. 获取浏览器池中已有的账号
-            pool_accounts = set(self.pool.get_all_account_ids())
+        for account_id in batch:
+            # 资源检查，资源紧张时停止补全
+            if not resource_monitor.is_safe_for_keepalive():
+                log_warn(f"账号同步: 资源紧张，暂停本轮补全（剩余 {len(self._pending_sync_accounts)} 个待补全）")
+                return  # 不从列表中移除，下次继续
 
-            # 3. 找出缺失的账号
-            missing_accounts = [acc for acc in all_accounts if acc not in pool_accounts]
+            try:
+                # 检查是否已在池中（可能被任务执行时按需创建了）
+                if self.pool.has_context(account_id):
+                    self._pending_sync_accounts.remove(account_id)
+                    continue
 
-            if not missing_accounts:
-                log_info(f"账号同步: 浏览器池账号完整（{len(pool_accounts)}/{len(all_accounts)}），无需补全")
-                return
+                # 从API获取该账号的Cookie
+                cookies = fetch_account_cookie(account_id)
+                if not cookies:
+                    log_warn(f"账号同步: {account_id} 无法获取Cookie，跳过")
+                    self._pending_sync_accounts.remove(account_id)
+                    continue
 
-            log_info(f"账号同步: 发现 {len(missing_accounts)} 个缺失账号，开始补全 "
-                     f"(池中 {len(pool_accounts)}/{len(all_accounts)})")
+                # 创建Context加入浏览器池
+                wrapper = self.pool.get_context(account_id, cookies)
+                if wrapper:
+                    success_count += 1
+                    log_info(f"账号同步: {account_id} 已补全到浏览器池")
+                else:
+                    log_warn(f"账号同步: {account_id} 创建Context失败")
 
-            # 4. 补全缺失账号
-            success_count = 0
-            for account_id in missing_accounts:
-                # 资源检查，资源紧张时停止补全
-                if not resource_monitor.is_safe_for_keepalive():
-                    log_warn(f"账号同步: 资源紧张，暂停补全（已补全 {success_count}/{len(missing_accounts)}）")
-                    break
+                self._pending_sync_accounts.remove(account_id)
 
-                try:
-                    # 从API获取该账号的Cookie
-                    cookies = fetch_account_cookie(account_id)
-                    if not cookies:
-                        log_warn(f"账号同步: {account_id} 无法获取Cookie，跳过")
-                        continue
+            except Exception as e:
+                log_warn(f"账号同步: {account_id} 补全异常: {e}")
+                self._pending_sync_accounts.remove(account_id)
 
-                    # 创建Context加入浏览器池
-                    wrapper = self.pool.get_context(account_id, cookies)
-                    if wrapper:
-                        success_count += 1
-                        log_info(f"账号同步: {account_id} 已补全到浏览器池")
-                    else:
-                        log_warn(f"账号同步: {account_id} 创建Context失败")
+            # 短暂等待，避免过快创建
+            time.sleep(1)
 
-                except Exception as e:
-                    log_warn(f"账号同步: {account_id} 补全异常: {e}")
+        remaining = len(self._pending_sync_accounts)
+        if success_count > 0 or remaining > 0:
+            log_info(f"账号同步本轮: 补全 {success_count} 个，剩余 {remaining} 个待补全")
 
-                # 短暂等待，避免过快创建
-                time.sleep(1)
-
-            log_info(f"账号同步完成: 补全 {success_count}/{len(missing_accounts)} 个账号")
-
-        except Exception as e:
-            log_error(f"账号同步异常: {e}", error=e, context="KeepaliveService.sync_accounts_from_server")
-
-    def perform_keepalive_batch(self) -> int:
+    def perform_keepalive_batch(self, allow_sync: bool = False) -> int:
         """执行一批保活操作（同步，必须在主线程调用）
 
         会先检查资源状态，资源紧张时自动跳过。
         每次调用处理最多 KEEPALIVE_BATCH_SIZE 个账号。
 
+        Args:
+            allow_sync: 是否允许执行账号同步补全。
+                        True = 当前确认处于空闲状态（连续无任务），可以补全缺失账号。
+                        False = 可能随时有任务，仅对已有Context做保活，不创建新Context。
+
         Returns:
             int: 成功保活的账号数，-1 表示因资源问题跳过
         """
-        # ===== 账号同步检查（定期补全缺失账号） =====
-        try:
-            self.sync_accounts_from_server()
-        except Exception as e:
-            log_warn(f"账号同步检查异常: {e}")
+        # ===== 账号同步检查（仅在空闲时补全缺失账号） =====
+        if allow_sync:
+            try:
+                self.sync_accounts_from_server()
+            except Exception as e:
+                log_warn(f"账号同步检查异常: {e}")
 
         # ===== 资源检查 =====
         if not resource_monitor.is_safe_for_keepalive():
