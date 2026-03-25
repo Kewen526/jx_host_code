@@ -7268,6 +7268,8 @@ def main():
     failed_tasks = 0
 
     _consecutive_no_task_count = 0            # 连续无任务计数
+    _local_retry_queue = []                   # 本地重试队列（资源紧张时暂存任务）
+    MAX_LOCAL_RETRIES = 3                     # 单个任务最大本地重试次数
 
     print("\n🚀 开始守护进程循环...")
     print("   按 Ctrl+C 可优雅退出\n")
@@ -7295,8 +7297,14 @@ def main():
                 time.sleep(5)
 
                 # ========== Step 3: 获取任务 ==========
-                # 浏览器池模式下传入服务器IP
-                if browser_pool_instance and server_ip:
+                # 优先从本地重试队列获取任务（资源紧张时暂存的任务）
+                if _local_retry_queue:
+                    task_info = _local_retry_queue.pop(0)
+                    _retry_count = task_info.get('_local_retry_count', 0)
+                    print(f"\n🔄 从本地重试队列取出任务（本地第{_retry_count}次重试）")
+                    print(f"   任务ID: {task_info.get('id')}, 账户: {task_info.get('account_id')}")
+                # 队列为空时从服务器获取
+                elif browser_pool_instance and server_ip:
                     task_info = fetch_task(server_ip=server_ip)
                 else:
                     task_info = fetch_task()
@@ -7342,7 +7350,9 @@ def main():
                                     continue
 
                                 # 正常：执行保活
-                                keepalive_service.perform_keepalive_batch()
+                                # 连续无任务>=3次才允许同步补全Context，避免任务执行期间创建大量Context
+                                _allow_sync = _consecutive_no_task_count >= 3
+                                keepalive_service.perform_keepalive_batch(allow_sync=_allow_sync)
 
                                 # 执行Context数量限制
                                 browser_pool_instance.enforce_context_limit()
@@ -7369,10 +7379,22 @@ def main():
                     if status == resource_monitor.STATUS_CRITICAL:
                         print("\n🚨 资源危险！暂停任务执行，等待资源恢复...")
                         resource_monitor.print_status()
-                        # 重置任务状态，避免任务丢失
-                        task_id = task_info.get('id')
-                        if task_id:
-                            reset_task_schedule(task_id)
+
+                        # 本地重试：将任务存入本地队列，而不是还给服务器
+                        _retry_count = task_info.get('_local_retry_count', 0) + 1
+                        task_info['_local_retry_count'] = _retry_count
+
+                        if _retry_count >= MAX_LOCAL_RETRIES:
+                            # 本地重试次数已达上限，还给服务器重新排队
+                            print(f"   ⚠️ 任务 {task_info.get('id')} 本地重试已达 {MAX_LOCAL_RETRIES} 次，还给服务器")
+                            task_id = task_info.get('id')
+                            if task_id:
+                                reset_task_schedule(task_id)
+                        else:
+                            # 存入本地重试队列，下一轮优先执行
+                            _local_retry_queue.append(task_info)
+                            print(f"   📥 任务 {task_info.get('id')} 存入本地重试队列（第{_retry_count}次，上限{MAX_LOCAL_RETRIES}次）")
+
                         browser_pool_instance.emergency_release()
                         # 等待30秒后重试
                         if not interruptible_sleep(30):
