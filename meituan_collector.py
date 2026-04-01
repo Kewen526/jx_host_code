@@ -1302,12 +1302,108 @@ def _fetch_review_stats(session: requests.Session, cookies: dict, mtgsig: str,
     return result
 
 
+def _fetch_trade_verified_amount(session: requests.Session, cookies: dict, mtgsig: str,
+                                  shop_id: str, date_range: str) -> Dict[str, float]:
+    """调用 optionDetail 接口获取核销金额数据
+    返回: {date_str: verified_amount}  例如 {'2026-03-18': 1778.7, ...}
+    """
+    print(f"\n  📊 任务4-核销金额 | 门店: {shop_id} | 日期: {date_range}")
+
+    url = "https://e.dianping.com/mda/v5/optionDetail"
+    timestamp = int(time.time() * 1000)
+
+    params = {
+        'yodaReady': 'h5',
+        'csecplatform': '4',
+        'csecversion': '4.2.0',
+        'mtgsig': _get_store_daily_stats_mtgsig(cookies, mtgsig),
+    }
+
+    post_data = {
+        'source': '1',
+        'device': 'pc',
+        'date': date_range,
+        'platform': '0',
+        'pageType': 'v5Trade',
+        'optionType': 'v5TradeDetail',
+        'shopIds': shop_id,
+        'excludeShopIds': '',
+        'cityId': '',
+        'prdIds': '1,2,3,4,5,6,11,12,13,14,15,16,17,18,19,20',
+        'spuId': '',
+        'pageNum': '',
+        'pageSize': '',
+        'sign': '',
+        'fromPage': '',
+        'storeKey': shop_id,
+        'timeStamp': str(timestamp),
+        'typeIds': '4',
+        'sortTypeId': '4',
+    }
+
+    result = {}
+
+    try:
+        resp = session.post(
+            url, params=params, data=post_data,
+            headers=_get_store_daily_stats_headers(), cookies=cookies, timeout=60
+        )
+        resp.raise_for_status()
+        resp_json = resp.json()
+
+        if not resp_json.get('success'):
+            print(f"   ❌ 接口返回失败: code={resp_json.get('code')}, msg={resp_json.get('msg')}")
+            return result
+
+        # 找到折线图数据 (componentId == "v5TradeLinePC")
+        line_data = None
+        for item in resp_json.get('data', []):
+            if item.get('componentId') == 'v5TradeLinePC':
+                line_data = item.get('body', {})
+                break
+
+        if not line_data:
+            print(f"   ⚠️ 未找到 v5TradeLinePC 组件数据")
+            return result
+
+        x_axis = line_data.get('xAxis', [])
+        series_list = line_data.get('series', [])
+
+        if not series_list:
+            print(f"   ⚠️ series 数据为空")
+            return result
+
+        data_values = series_list[0].get('data', [])
+
+        if len(x_axis) != len(data_values):
+            print(f"   ⚠️ xAxis({len(x_axis)}) 与 data({len(data_values)}) 长度不一致")
+            return result
+
+        # 将 date_range "YYYY-MM-DD,YYYY-MM-DD" 解析出起始日期，用于推算完整日期
+        start_date_str = date_range.split(',')[0]
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+
+        for i, (axis_label, value) in enumerate(zip(x_axis, data_values)):
+            # 用起始日期 + 偏移天数推算完整日期，比解析 "MM/DD" 更可靠
+            full_date = start_date + timedelta(days=i)
+            date_str = full_date.strftime('%Y-%m-%d')
+            result[date_str] = float(value) if value is not None else 0.0
+
+        print(f"   ✅ 解析完成，共 {len(result)} 个日期")
+
+    except Exception as e:
+        print(f"   ❌ 核销金额获取异常: {e}")
+
+    return result
+
+
 def _merge_store_daily_stats(
     whereabouts_by_shop: Dict[str, Dict[str, Dict[str, int]]],
     flow_by_shop: Dict[str, Dict[str, Dict[str, int]]],
     review_data: Dict[tuple, int],
+    trade_by_shop: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[tuple, dict]:
-    """合并三份数据，以 (date, shop_id) 为 key"""
+    """合并四份数据，以 (date, shop_id) 为 key"""
     merged = {}
 
     def ensure_key(date, shop_id):
@@ -1329,6 +1425,12 @@ def _merge_store_daily_stats(
     for (date_str, shop_id), new_rev in review_data.items():
         k = ensure_key(date_str, shop_id)
         merged[k]['new_review'] = new_rev
+
+    if trade_by_shop:
+        for shop_id, date_dict in trade_by_shop.items():
+            for date_str, amount in date_dict.items():
+                k = ensure_key(date_str, shop_id)
+                merged[k]['verified_amount'] = amount
 
     return merged
 
@@ -1546,10 +1648,28 @@ def run_store_daily_stats_collection(account_name: str, cookies: dict, mtgsig: s
             print(f"  ❌ 任务3失败，异常: {e}")
             review_data = {}
 
+        # 任务4：逐门店获取核销金额
+        print(f"\n{'─' * 50}")
+        print(f"▶ [store_daily_stats] 任务4：核销金额（共 {len(active_shops)} 个门店）")
+        print(f"{'─' * 50}")
+
+        trade_by_shop = {}
+        for shop in active_shops:
+            shop_id = str(shop['shop_id'])
+            shop_name = shop['shop_name']
+            print(f"\n  🏪 门店: {shop_name} ({shop_id})")
+            try:
+                result = _fetch_trade_verified_amount(session, cookies, mtgsig, shop_id, date_range)
+                trade_by_shop[shop_id] = result
+            except Exception as e:
+                print(f"  ❌ 跳过，异常: {e}")
+                trade_by_shop[shop_id] = {}
+            random_delay(2, 4)
+
         # 5. 合并数据
         print(f"\n{'─' * 50}")
-        print("📊 [store_daily_stats] 合并三份数据...")
-        merged = _merge_store_daily_stats(whereabouts_by_shop, flow_by_shop, review_data)
+        print("📊 [store_daily_stats] 合并四份数据...")
+        merged = _merge_store_daily_stats(whereabouts_by_shop, flow_by_shop, review_data, trade_by_shop)
         print(f"   合并后共 {len(merged)} 条 (日期×门店)")
 
         # 6. 上传数据
