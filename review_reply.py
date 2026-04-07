@@ -12,6 +12,7 @@
 """
 
 import json
+import threading
 import requests
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -33,27 +34,32 @@ GET_PLATFORM_ACCOUNT_API = f"{API_BASE_URL}/api/get_platform_account"
 REPLY_API_URL = "https://e.dianping.com/review/app/reply/ajax/reviewreply"
 API_TIMEOUT = 30
 
-# 当前处理的账号（模块级变量，由 process_review_replies 设置）
-_current_account = "-"
+# 线程安全的当前账号存储（每个线程独立，避免并发覆盖）
+_thread_local = threading.local()
 
 
 # ============================================================================
 # 日志函数
 # ============================================================================
 
+def _get_current_account() -> str:
+    """获取当前线程的账号标识（线程安全）"""
+    return getattr(_thread_local, 'account', '-')
+
+
 def log_info(message: str):
     """输出信息日志"""
-    _log_review(_current_account, message, "INFO")
+    _log_review(_get_current_account(), message, "INFO")
 
 
 def log_warn(message: str):
     """输出警告日志"""
-    _log_review(_current_account, message, "WARN")
+    _log_review(_get_current_account(), message, "WARN")
 
 
 def log_error(message: str):
     """输出错误日志"""
-    _log_review(_current_account, message, "ERROR")
+    _log_review(_get_current_account(), message, "ERROR")
 
 
 # ============================================================================
@@ -282,8 +288,7 @@ def process_review_replies(account: str, cookies: Dict) -> Dict[str, int]:
     Returns:
         处理统计 {"total": 总数, "success": 成功数, "failed": 失败数}
     """
-    global _current_account
-    _current_account = account
+    _thread_local.account = account
 
     stats = {"total": 0, "success": 0, "failed": 0}
 
