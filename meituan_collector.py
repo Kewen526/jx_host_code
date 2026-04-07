@@ -25,6 +25,9 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from contextlib import contextmanager
 
+# 统一日志模块导入
+from logger import log_collect, log_system, setup_stdout_redirect
+
 # Playwright导入 (用于store_stats任务)
 try:
     from playwright.sync_api import sync_playwright
@@ -1545,6 +1548,7 @@ def run_store_daily_stats_collection(account_name: str, cookies: dict, mtgsig: s
     Returns:
         标准结果字典 {task_name, success, record_count, error_message}
     """
+    log_collect(account_name, "开始执行 store_daily_stats 门店每日统计数据采集")
     print(f"\n{'=' * 60}")
     print(f"📊 [store_daily_stats] 开始门店每日统计数据采集")
     print(f"{'=' * 60}")
@@ -2868,6 +2872,7 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
         mtgsig: 外部传入的签名（可选）
     """
     table_name = "kewen_daily_report"
+    log_collect(account_name, f"开始执行 {table_name} 日期={start_date}~{end_date}")
     print(f"\n{'=' * 60}")
     print(f"📊 {table_name}")
     print(f"{'=' * 60}")
@@ -3126,6 +3131,11 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
         if session:
             session.close()
 
+    if result.get("success"):
+        log_collect(account_name, f"{table_name} 完成，记录数={result.get('record_count', 0)}")
+    else:
+        log_collect(account_name, f"{table_name} 失败: {result.get('error_message', '未知')}", "ERROR")
+
     return result
 
 
@@ -3144,6 +3154,7 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
         mtgsig: 外部传入的签名（可选）
     """
     table_name = "promotion_daily_report"
+    log_collect(account_name, f"开始执行 {table_name} 日期={start_date}~{end_date}")
     print(f"\n{'=' * 60}")
     print(f"📊 {table_name}")
     print(f"{'=' * 60}")
@@ -3382,6 +3393,11 @@ def run_promotion_daily_report(account_name: str, start_date: str, end_date: str
         if session:
             session.close()
 
+    if result.get("success"):
+        log_collect(account_name, f"{table_name} 完成，记录数={result.get('record_count', 0)}")
+    else:
+        log_collect(account_name, f"{table_name} 失败: {result.get('error_message', '未知')}", "ERROR")
+
     return result
 
 
@@ -3401,6 +3417,7 @@ def run_review_detail_dianping(account_name: str, start_date: str, end_date: str
         shop_info: 外部传入的门店信息（可选）
     """
     table_name = "review_detail_dianping"
+    log_collect(account_name, f"开始执行 {table_name} 日期={start_date}~{end_date}")
     print(f"\n{'=' * 60}")
     print(f"💬 {table_name}")
     print(f"{'=' * 60}")
@@ -3655,6 +3672,11 @@ def run_review_detail_dianping(account_name: str, start_date: str, end_date: str
         traceback.print_exc()
         log_failure(account_name, 0, table_name, start_date, end_date, str(e))
 
+    if result.get("success"):
+        log_collect(account_name, f"{table_name} 完成，记录数={result.get('record_count', 0)}")
+    else:
+        log_collect(account_name, f"{table_name} 失败: {result.get('error_message', '未知')}", "ERROR")
+
     return result
 
 
@@ -3674,6 +3696,7 @@ def run_review_detail_meituan(account_name: str, start_date: str, end_date: str,
         shop_info: 外部传入的门店信息（可选）
     """
     table_name = "review_detail_meituan"
+    log_collect(account_name, f"开始执行 {table_name} 日期={start_date}~{end_date}")
     print(f"\n{'=' * 60}")
     print(f"🍔 {table_name}")
     print(f"{'=' * 60}")
@@ -3931,6 +3954,11 @@ def run_review_detail_meituan(account_name: str, start_date: str, end_date: str,
         traceback.print_exc()
         log_failure(account_name, 0, table_name, start_date, end_date, str(e))
 
+    if result.get("success"):
+        log_collect(account_name, f"{table_name} 完成，记录数={result.get('record_count', 0)}")
+    else:
+        log_collect(account_name, f"{table_name} 失败: {result.get('error_message', '未知')}", "ERROR")
+
     return result
 
 
@@ -3950,6 +3978,7 @@ def run_review_summary_dianping(account_name: str, start_date: str, end_date: st
         shop_info: 外部传入的门店信息（可选）
     """
     table_name = "review_summary_dianping"
+    log_collect(account_name, f"开始执行 {table_name} 日期={start_date}~{end_date}")
     print(f"\n{'=' * 60}")
     print(f"💬 {table_name}")
     print(f"{'=' * 60}")
@@ -4181,6 +4210,11 @@ def run_review_summary_dianping(account_name: str, start_date: str, end_date: st
         traceback.print_exc()
         log_failure(account_name, 0, table_name, start_date, end_date, str(e))
 
+    if result.get("success"):
+        log_collect(account_name, f"{table_name} 完成，记录数={result.get('record_count', 0)}")
+    else:
+        log_collect(account_name, f"{table_name} 失败: {result.get('error_message', '未知')}", "ERROR")
+
     return result
 
 
@@ -4200,6 +4234,7 @@ def run_review_summary_meituan(account_name: str, start_date: str, end_date: str
         shop_info: 外部传入的门店信息（可选）
     """
     table_name = "review_summary_meituan"
+    log_collect(account_name, f"开始执行 {table_name} 日期={start_date}~{end_date}")
     print(f"\n{'=' * 60}")
     print(f"🍔 {table_name}")
     print(f"{'=' * 60}")
@@ -4433,6 +4468,11 @@ def run_review_summary_meituan(account_name: str, start_date: str, end_date: str
         import traceback
         traceback.print_exc()
         log_failure(account_name, 0, table_name, start_date, end_date, str(e))
+
+    if result.get("success"):
+        log_collect(account_name, f"{table_name} 完成，记录数={result.get('record_count', 0)}")
+    else:
+        log_collect(account_name, f"{table_name} 失败: {result.get('error_message', '未知')}", "ERROR")
 
     return result
 
@@ -7099,6 +7139,8 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
         START_DATE = start_date
         END_DATE = end_date
 
+    log_collect(account_name, f"开始执行任务 task_id={task_id} task_type={task} 日期范围={start_date}~{end_date}")
+
     print(f"\n{'=' * 80}")
     print("📌 任务配置")
     print(f"{'=' * 80}")
@@ -7110,7 +7152,7 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
     # 验证参数
     if not account_name:
         error_msg = "账户名称为空"
-        print(f"❌ {error_msg}")
+        log_collect(account_name, f"任务失败: {error_msg}", "ERROR")
         report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
@@ -7223,7 +7265,7 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
             results.append(result)
     except Exception as e:
         error_msg = f"任务执行异常: {str(e)}"
-        print(f"❌ {error_msg}")
+        log_collect(account_name, f"任务异常 task_id={task_id}: {error_msg}", "ERROR")
         if is_context_closed_error(e):
             # Context 被硬件/代码原因强制关闭，不是业务失败，不计入重试次数
             # 直接归还任务到队列，等待下次调度重新执行
@@ -7240,7 +7282,7 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
     # 检查结果是否为空（所有任务未执行，可能是登录失效或启动失败）
     if len(results) == 0:
         error_msg = "所有任务未执行（登录失效或启动失败）"
-        print(f"❌ {error_msg}")
+        log_collect(account_name, f"任务失败 task_id={task_id}: {error_msg}", "ERROR")
         # 上报cookie失效状态到platform_accounts
         report_auth_invalid(account_name)
         log_failure(account_name, 0, "all_tasks_not_executed", start_date, end_date, error_msg)
@@ -7271,15 +7313,18 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
                 has_real_error = True
 
     if len(task_errors) == 0:
+        log_collect(account_name, f"任务成功 task_id={task_id} task_type={task}")
         report_task_callback(task_id, status=2, error_message="", retry_add=0)
         return True
     elif has_no_access and not has_real_error:
         # 所有失败均为无访问权限，上报 status=4，不需要重试
         all_errors = "\n".join(task_errors)
+        log_collect(account_name, f"任务无权限 task_id={task_id}: {all_errors}", "WARN")
         report_task_callback(task_id, status=4, error_message=all_errors, retry_add=0)
         return False
     else:
         all_errors = "\n".join(task_errors)
+        log_collect(account_name, f"任务失败 task_id={task_id}: {all_errors}", "ERROR")
         report_task_callback(task_id, status=3, error_message=all_errors, retry_add=1)
         return False
 
@@ -7332,6 +7377,9 @@ def main():
 
     import atexit
     atexit.register(_remove_pid_file)
+
+    # ========== 初始化日志系统 ==========
+    setup_stdout_redirect()
 
     # ========== 初始化 ==========
     print("\n" + "=" * 80)
