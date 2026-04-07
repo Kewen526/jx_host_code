@@ -34,6 +34,12 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
     print("⚠️ 未安装playwright，浏览器池功能将不可用")
 
+# 统一日志模块导入
+from logger import (
+    log_keepalive, log_system, log_review as _log_review_module,
+    setup_stdout_redirect,
+)
+
 # 评价回复模块导入
 try:
     from review_reply import process_review_replies
@@ -120,24 +126,23 @@ _pool_running = True
 # ============================================================================
 
 def log_print(message: str, level: str = "INFO"):
-    """带时间戳的日志打印
+    """带时间戳的日志打印（系统模块）
 
     Args:
         message: 日志消息
         level: 日志级别 (INFO, WARN, ERROR)
     """
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f"[{timestamp}] [{level}] {message}")
+    log_system(message, level)
 
 
 def log_info(message: str):
     """INFO级别日志"""
-    log_print(message, "INFO")
+    log_system(message, "INFO")
 
 
 def log_warn(message: str):
     """WARN级别日志"""
-    log_print(message, "WARN")
+    log_system(message, "WARN")
 
 
 def log_error(message: str, error: Exception = None, upload: bool = True,
@@ -158,7 +163,7 @@ def log_error(message: str, error: Exception = None, upload: bool = True,
     if error:
         full_message += f" | Exception: {type(error).__name__}: {str(error)}"
 
-    log_print(full_message, "ERROR")
+    log_system(full_message, "ERROR")
 
     # 上传到服务器
     if upload:
@@ -182,11 +187,11 @@ def log_error(message: str, error: Exception = None, upload: bool = True,
             )
 
             if response.status_code != 200:
-                log_print(f"日志上传失败: HTTP {response.status_code}", "WARN")
+                log_system(f"日志上传失败: HTTP {response.status_code}", "WARN")
 
         except Exception as upload_error:
             # 上传失败不影响主流程，只打印警告
-            log_print(f"日志上传异常: {upload_error}", "WARN")
+            log_system(f"日志上传异常: {upload_error}", "WARN")
 
 
 def upload_error_log(error_type: str, error_message: str,
@@ -222,7 +227,7 @@ def upload_error_log(error_type: str, error_message: str,
         return response.status_code == 200
 
     except Exception as e:
-        log_print(f"日志上传异常: {e}", "WARN")
+        log_system(f"日志上传异常: {e}", "WARN")
         return False
 
 
@@ -2146,8 +2151,10 @@ class KeepaliveService:
     def get_accounts_needing_keepalive(self) -> List[str]:
         """获取需要保活的账号列表
 
-        返回 last_keepalive_at 超过 KEEPALIVE_INTERVAL 的账号，
-        排除在冷却期的账号，按最后保活时间排序（最久未保活的优先）
+        遍历 _known_accounts（而非仅 _contexts），确保所有服务器分配的账号
+        都能被触达。对于有 Context 的账号，检查 last_keepalive_at；
+        对于无 Context 的账号（被释放过），也加入保活队列（会按需创建Context）。
+        排除在冷却期的账号，按最后保活时间排序（最久未保活的优先）。
 
         Returns:
             List[str]: 需要保活的账号ID列表
@@ -2156,18 +2163,24 @@ class KeepaliveService:
         now = datetime.now()
 
         with self.pool._lock:
-            for account_id, wrapper in self.pool._contexts.items():
+            # 遍历所有已知账号（包括有Context和无Context的）
+            for account_id in self.pool._known_accounts:
                 # 检查是否在冷却期
                 if self._is_in_cooldown(account_id):
                     continue
 
-                # 检查是否需要保活
-                if wrapper.last_keepalive_at is None:
-                    accounts_to_keepalive.append((account_id, datetime.min))
+                if account_id in self.pool._contexts:
+                    # 有 Context：检查保活间隔
+                    wrapper = self.pool._contexts[account_id]
+                    if wrapper.last_keepalive_at is None:
+                        accounts_to_keepalive.append((account_id, datetime.min))
+                    else:
+                        time_since_keepalive = (now - wrapper.last_keepalive_at).total_seconds()
+                        if time_since_keepalive >= KEEPALIVE_INTERVAL:
+                            accounts_to_keepalive.append((account_id, wrapper.last_keepalive_at))
                 else:
-                    time_since_keepalive = (now - wrapper.last_keepalive_at).total_seconds()
-                    if time_since_keepalive >= KEEPALIVE_INTERVAL:
-                        accounts_to_keepalive.append((account_id, wrapper.last_keepalive_at))
+                    # 无 Context（被释放过）：需要保活（会按需创建Context）
+                    accounts_to_keepalive.append((account_id, datetime.min))
 
         # 按最后保活时间排序（最久未保活的优先）
         accounts_to_keepalive.sort(key=lambda x: x[1])
@@ -2210,10 +2223,10 @@ class KeepaliveService:
                 self._pending_sync_accounts = [acc for acc in all_accounts if acc not in pool_accounts]
 
                 if not self._pending_sync_accounts:
-                    log_info(f"账号同步: 浏览器池账号完整（{len(pool_accounts)}/{len(all_accounts)}），无需补全")
+                    log_keepalive("-", f"账号同步: 浏览器池账号完整（{len(pool_accounts)}/{len(all_accounts)}），无需补全")
                     return
 
-                log_info(f"账号同步: 发现 {len(self._pending_sync_accounts)} 个缺失账号，将渐进式补全 "
+                log_keepalive("-", f"账号同步: 发现 {len(self._pending_sync_accounts)} 个缺失账号，将渐进式补全 "
                          f"(池中 {len(pool_accounts)}/{len(all_accounts)})")
 
             except Exception as e:
@@ -2231,7 +2244,7 @@ class KeepaliveService:
         for account_id in batch:
             # 资源检查，资源紧张时停止补全
             if not resource_monitor.is_safe_for_keepalive():
-                log_warn(f"账号同步: 资源紧张，暂停本轮补全（剩余 {len(self._pending_sync_accounts)} 个待补全）")
+                log_keepalive("-", f"账号同步: 资源紧张，暂停本轮补全（剩余 {len(self._pending_sync_accounts)} 个待补全）", "WARN")
                 return  # 不从列表中移除，下次继续
 
             try:
@@ -2243,7 +2256,7 @@ class KeepaliveService:
                 # 从API获取该账号的Cookie
                 cookies = fetch_account_cookie(account_id)
                 if not cookies:
-                    log_warn(f"账号同步: {account_id} 无法获取Cookie，跳过")
+                    log_keepalive(account_id, "账号同步: 无法获取Cookie，跳过", "WARN")
                     self._pending_sync_accounts.remove(account_id)
                     continue
 
@@ -2251,14 +2264,14 @@ class KeepaliveService:
                 wrapper = self.pool.get_context(account_id, cookies)
                 if wrapper:
                     success_count += 1
-                    log_info(f"账号同步: {account_id} 已补全到浏览器池")
+                    log_keepalive(account_id, "账号同步: 已补全到浏览器池")
                 else:
-                    log_warn(f"账号同步: {account_id} 创建Context失败")
+                    log_keepalive(account_id, "账号同步: 创建Context失败", "WARN")
 
                 self._pending_sync_accounts.remove(account_id)
 
             except Exception as e:
-                log_warn(f"账号同步: {account_id} 补全异常: {e}")
+                log_keepalive(account_id, f"账号同步: 补全异常: {e}", "WARN")
                 self._pending_sync_accounts.remove(account_id)
 
             # 短暂等待，避免过快创建
@@ -2266,7 +2279,7 @@ class KeepaliveService:
 
         remaining = len(self._pending_sync_accounts)
         if success_count > 0 or remaining > 0:
-            log_info(f"账号同步本轮: 补全 {success_count} 个，剩余 {remaining} 个待补全")
+            log_keepalive("-", f"账号同步本轮: 补全 {success_count} 个，剩余 {remaining} 个待补全")
 
     def perform_keepalive_batch(self, allow_sync: bool = False) -> int:
         """执行一批保活操作（同步，必须在主线程调用）
@@ -2308,20 +2321,20 @@ class KeepaliveService:
         batch = accounts[:KEEPALIVE_BATCH_SIZE]
         cooldown_count = len(self._fail_cooldown)
 
-        print(f"\n🔄 执行保活批次，本批 {len(batch)} 个（待保活 {len(accounts)}，冷却中 {cooldown_count}）")
+        log_keepalive("-", f"执行保活批次，本批 {len(batch)} 个（待保活 {len(accounts)}，冷却中 {cooldown_count}）")
         resource_monitor.print_status()
 
         success_count = 0
         for account_id in batch:
             # 每个账号执行前再次检查资源
             if not resource_monitor.is_safe_for_keepalive():
-                print("   ⏸️ 资源紧张，中断本批保活")
+                log_keepalive("-", "资源紧张，中断本批保活", "WARN")
                 break
 
             if self._keepalive_single(account_id):
                 success_count += 1
 
-        print(f"   ✅ 本批保活完成: {success_count}/{len(batch)} 成功")
+        log_keepalive("-", f"本批保活完成: {success_count}/{len(batch)} 成功")
 
         return success_count
 
@@ -2367,27 +2380,47 @@ class KeepaliveService:
     def _keepalive_single(self, account_id: str) -> bool:
         """对单个账号执行保活
 
-        使用安全的页面跳转方法，自动处理浏览器失效
+        支持 Context 不存在时按需创建（从API获取Cookie）。
+        使用安全的页面跳转方法，自动处理浏览器失效。
 
         Returns:
             bool: 是否成功
         """
         # 尝试获取锁（非阻塞）
         if not account_lock_manager.try_lock(account_id):
-            log_info(f"{account_id} 正在执行任务，跳过保活")
+            log_keepalive(account_id, "正在执行任务，跳过保活")
             return False
 
         try:
+            # 如果没有 Context，按需创建（从API获取Cookie）
             if not self.pool.has_context(account_id):
-                return False
+                # 资源紧张时不创建新 Context
+                if not resource_monitor.is_safe_for_keepalive():
+                    log_keepalive(account_id, "资源紧张，跳过无Context账号的保活", "WARN")
+                    return False
 
-            wrapper = self.pool._contexts.get(account_id)
-            if not wrapper:
-                return False
+                log_keepalive(account_id, "无Context，尝试从API获取Cookie并按需创建")
+                cookies = fetch_account_cookie(account_id)
+                if not cookies:
+                    log_keepalive(account_id, "无法获取Cookie，跳过保活", "WARN")
+                    self._set_cooldown(account_id)
+                    return False
+
+                wrapper = self.pool.get_context(account_id, cookies)
+                if not wrapper:
+                    log_keepalive(account_id, "创建Context失败，跳过保活", "WARN")
+                    self._set_cooldown(account_id)
+                    return False
+
+                log_keepalive(account_id, "按需创建Context成功")
+            else:
+                wrapper = self.pool._contexts.get(account_id)
+                if not wrapper:
+                    return False
 
             # 使用健康检查验证 wrapper 是否有效
             if not wrapper.is_valid():
-                log_warn(f"{account_id} Context 已失效，跳过保活并移除")
+                log_keepalive(account_id, "Context 已失效，跳过保活并移除", "WARN")
                 upload_error_log(
                     error_type="ContextInvalid",
                     error_message="保活时发现 Context 已失效",
@@ -2399,12 +2432,12 @@ class KeepaliveService:
                 self._set_cooldown(account_id)
                 return False
 
-            log_info(f"保活 {account_id}...")
+            log_keepalive(account_id, "开始保活")
 
             # 使用安全的页面跳转
             if not wrapper.safe_goto(KEEPALIVE_PAGE_URL, wait_until='load',
                                       timeout=KEEPALIVE_TIMEOUT, max_retries=1):
-                log_warn(f"{account_id} 保活页面跳转失败")
+                log_keepalive(account_id, "保活页面跳转失败", "WARN")
                 upload_error_log(
                     error_type="KeepaliveGotoFailed",
                     error_message="保活页面跳转失败",
@@ -2422,9 +2455,10 @@ class KeepaliveService:
             try:
                 current_url = wrapper.page.url
             except Exception as e:
-                log_error(
-                    f"{account_id} 获取页面URL失败",
-                    error=e,
+                log_keepalive(account_id, f"获取页面URL失败: {e}", "ERROR")
+                upload_error_log(
+                    error_type="KeepalivePageError",
+                    error_message=f"获取页面URL失败: {e}",
                     context="KeepaliveService._keepalive_single",
                     account_id=account_id
                 )
@@ -2434,7 +2468,7 @@ class KeepaliveService:
 
             # 检查是否被重定向到登录页
             if 'login' in current_url.lower():
-                log_warn(f"{account_id} Cookie已失效，上报失效状态")
+                log_keepalive(account_id, "Cookie已失效，上报失效状态", "WARN")
                 self._report_cookie_invalid(account_id)
                 # 移除失效的Context（跳过Cookie上传，避免覆盖auth_status=invalid）
                 self.pool.remove_context(account_id, skip_cookie_upload=True)
@@ -2442,14 +2476,15 @@ class KeepaliveService:
                 return False
 
             # 获取并上传Cookie
+            cookies = {}
             try:
                 cookies = wrapper.get_cookies()
                 cookie_upload_queue.put(account_id, cookies)
             except Exception as e:
-                log_warn(f"{account_id} 获取Cookie失败: {e}")
+                log_keepalive(account_id, f"获取Cookie失败: {e}", "WARN")
 
             wrapper.update_last_keepalive()
-            log_info(f"{account_id} 保活成功")
+            log_keepalive(account_id, "保活成功")
 
             # 保活成功后执行评价回复任务
             if REVIEW_REPLY_AVAILABLE and cookies:
@@ -2462,16 +2497,17 @@ class KeepaliveService:
                         daemon=True
                     )
                     reply_thread.start()
-                    log_info(f"{account_id} 评价回复任务已启动")
+                    log_keepalive(account_id, "评价回复任务已启动")
                 except Exception as e:
-                    log_warn(f"{account_id} 启动评价回复任务失败: {e}")
+                    log_keepalive(account_id, f"启动评价回复任务失败: {e}", "WARN")
 
             return True
 
         except Exception as e:
-            log_error(
-                f"{account_id} 保活异常",
-                error=e,
+            log_keepalive(account_id, f"保活异常: {type(e).__name__}: {e}", "ERROR")
+            upload_error_log(
+                error_type="KeepaliveException",
+                error_message=str(e),
                 context="KeepaliveService._keepalive_single",
                 account_id=account_id
             )
@@ -2493,9 +2529,9 @@ class KeepaliveService:
                 timeout=30
             )
             if response.status_code == 200:
-                print(f"   ✅ 已上报 {account_id} Cookie失效")
+                log_keepalive(account_id, "已上报Cookie失效")
         except Exception as e:
-            print(f"   ❌ 上报失效状态异常: {e}")
+            log_keepalive(account_id, f"上报失效状态异常: {e}", "ERROR")
 
 
 # ============================================================================

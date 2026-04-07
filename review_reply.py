@@ -16,6 +16,9 @@ import requests
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
+# 统一日志模块导入
+from logger import log_review as _log_review
+
 
 # ============================================================================
 # 配置参数
@@ -30,6 +33,9 @@ GET_PLATFORM_ACCOUNT_API = f"{API_BASE_URL}/api/get_platform_account"
 REPLY_API_URL = "https://e.dianping.com/review/app/reply/ajax/reviewreply"
 API_TIMEOUT = 30
 
+# 当前处理的账号（模块级变量，由 process_review_replies 设置）
+_current_account = "-"
+
 
 # ============================================================================
 # 日志函数
@@ -37,20 +43,17 @@ API_TIMEOUT = 30
 
 def log_info(message: str):
     """输出信息日志"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f"[{timestamp}] [INFO] [评价回复] {message}")
+    _log_review(_current_account, message, "INFO")
 
 
 def log_warn(message: str):
     """输出警告日志"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f"[{timestamp}] [WARN] [评价回复] {message}")
+    _log_review(_current_account, message, "WARN")
 
 
 def log_error(message: str):
     """输出错误日志"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f"[{timestamp}] [ERROR] [评价回复] {message}")
+    _log_review(_current_account, message, "ERROR")
 
 
 # ============================================================================
@@ -279,6 +282,9 @@ def process_review_replies(account: str, cookies: Dict) -> Dict[str, int]:
     Returns:
         处理统计 {"total": 总数, "success": 成功数, "failed": 失败数}
     """
+    global _current_account
+    _current_account = account
+
     stats = {"total": 0, "success": 0, "failed": 0}
 
     try:
