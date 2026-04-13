@@ -5197,13 +5197,13 @@ class DianpingStoreStats:
         }
 
     def _calculate_flow_date_range(self) -> str:
-        """计算客流数据的日期范围"""
+        """计算客流数据的日期范围（近30天）"""
         now = datetime.now()
         if now.hour < 7:
             end_date = now - timedelta(days=2)
         else:
             end_date = now - timedelta(days=1)
-        start_date = end_date - timedelta(days=6)
+        start_date = end_date - timedelta(days=29)
         return f"{start_date.strftime('%Y-%m-%d')},{end_date.strftime('%Y-%m-%d')}"
 
     def _get_yesterday_date(self) -> str:
