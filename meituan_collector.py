@@ -7347,21 +7347,26 @@ def main():
     """
     global _daemon_running
 
-    # ========== 单例检查: 防止多进程同时运行 ==========
-    PID_FILE = "/home/meituan/data/meituan_collector.pid"
+    # ========== 解析 worker-id 参数（支持多进程并发） ==========
+    import argparse
+    _parser = argparse.ArgumentParser(add_help=False)
+    _parser.add_argument('--worker-id', type=int, default=1)
+    _args, _ = _parser.parse_known_args()
+    WORKER_ID = _args.worker_id
+
+    # ========== 单例检查: 同 worker-id 不允许重复运行 ==========
+    PID_FILE = f"/home/meituan/data/meituan_collector_{WORKER_ID}.pid"
     os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
 
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, "r") as _f:
                 _old_pid = int(_f.read().strip())
-            # 检查旧进程是否仍在运行
             os.kill(_old_pid, 0)
-            print(f"❌ 已有实例正在运行 (PID={_old_pid})，本次启动退出。")
+            print(f"❌ Worker-{WORKER_ID} 已有实例正在运行 (PID={_old_pid})，本次启动退出。")
             print(f"   若旧进程已卡死，请先执行: kill {_old_pid} && rm {PID_FILE}")
             sys.exit(1)
         except (ProcessLookupError, ValueError):
-            # 旧进程已不存在，清理残留 PID 文件
             os.remove(PID_FILE)
 
     # 写入当前 PID
@@ -7383,8 +7388,9 @@ def main():
 
     # ========== 初始化 ==========
     print("\n" + "=" * 80)
-    print("美团点评数据采集系统 (守护进程模式)")
+    print(f"美团点评数据采集系统 (守护进程模式) [Worker-{WORKER_ID}]")
     print("=" * 80)
+    print(f"   Worker ID: {WORKER_ID}")
     print(f"   运行模式: {'开发模式 (24小时运行)' if DEV_MODE else f'生产模式 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)'}")
     print(f"   浏览器池: {'启用' if USE_BROWSER_POOL and BROWSER_POOL_AVAILABLE else '禁用'}")
     print(f"   无任务等待: {NO_TASK_WAIT_SECONDS // 60} 分钟")

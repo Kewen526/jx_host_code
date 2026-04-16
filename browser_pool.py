@@ -2486,20 +2486,7 @@ class KeepaliveService:
             wrapper.update_last_keepalive()
             log_keepalive(account_id, "保活成功")
 
-            # 保活成功后执行评价回复任务
-            if REVIEW_REPLY_AVAILABLE and cookies:
-                try:
-                    # 使用线程异步执行，不阻塞保活流程
-                    reply_thread = threading.Thread(
-                        target=process_review_replies,
-                        args=(account_id, cookies),
-                        name=f"ReviewReply-{account_id}",
-                        daemon=True
-                    )
-                    reply_thread.start()
-                    log_keepalive(account_id, "评价回复任务已启动")
-                except Exception as e:
-                    log_keepalive(account_id, f"启动评价回复任务失败: {e}", "WARN")
+            # 评价回复已拆分为独立守护进程 review_reply_runner.py，不再从保活触发
 
             return True
 
