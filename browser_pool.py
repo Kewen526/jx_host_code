@@ -58,13 +58,13 @@ MAX_BROWSERS = 10                    # 最大Browser数量
 MAX_CONTEXTS_PER_BROWSER = 15        # 每个Browser最大Context数量
 BROWSER_TYPE = "chromium"            # 浏览器类型: webkit / chromium / firefox
 
-# 保活配置（延长Cookie登录有效期）
-KEEPALIVE_INTERVAL = 20 * 60         # 保活间隔（秒）：20分钟，缩短以避免Cookie在刷新前失效
+# 保活配置（优化后）
+KEEPALIVE_INTERVAL = 60 * 60         # 保活间隔（秒）：60分钟（原30分钟）
 KEEPALIVE_PAGE_URL = "https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html"
-KEEPALIVE_BATCH_SIZE = 5             # 每批保活账号数量：提高到5，使账号能更快轮到保活
-KEEPALIVE_BATCH_INTERVAL = 30        # 每批之间的间隔（秒）：缩短到30秒，加快整体保活节奏
-KEEPALIVE_TIMEOUT = 15000            # 保活页面超时（毫秒）：15秒
-KEEPALIVE_FAIL_COOLDOWN = 5 * 60     # 失败冷却时间（秒）：5分钟，缩短后能更快重试保活
+KEEPALIVE_BATCH_SIZE = 2             # 每批保活账号数量（原5个）
+KEEPALIVE_BATCH_INTERVAL = 60        # 每批之间的间隔（秒）
+KEEPALIVE_TIMEOUT = 15000            # 保活页面超时（毫秒）：15秒（原30秒）
+KEEPALIVE_FAIL_COOLDOWN = 10 * 60    # 失败冷却时间（秒）：10分钟
 
 # 资源保护配置
 RESOURCE_CHECK_INTERVAL = 30         # 资源检查间隔（秒）
@@ -73,7 +73,7 @@ CPU_CRITICAL_THRESHOLD = 70          # CPU危险阈值（%）
 MEMORY_WARNING_THRESHOLD = 60        # 内存警告阈值（%）
 MEMORY_CRITICAL_THRESHOLD = 80       # 内存危险阈值（%）
 MAX_ACTIVE_CONTEXTS = 10             # 最大活跃Context数量
-CONTEXT_IDLE_TIMEOUT = 60 * 60       # Context空闲超时（秒）：60分钟，避免Context被频繁销毁重建
+CONTEXT_IDLE_TIMEOUT = 30 * 60       # Context空闲超时（秒）：30分钟
 
 # 浏览器重启配置
 BROWSER_RESTART_HOUR = 3             # 每天重启时间（凌晨3点）
@@ -2486,7 +2486,7 @@ class KeepaliveService:
             wrapper.update_last_keepalive()
             log_keepalive(account_id, "保活成功")
 
-            # 注：评价回复已解耦为独立脚本 review_reply_runner.py，不再在保活成功后触发
+            # 评价回复已拆分为独立守护进程 review_reply_runner.py，不再从保活触发
 
             return True
 

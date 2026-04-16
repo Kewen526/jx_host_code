@@ -19,8 +19,6 @@ import sys
 import subprocess
 import signal
 import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -87,15 +85,10 @@ HEADLESS = True                     # 浏览器模式: True=后台运行, False=
 # ============================================================================
 # ★★★ 守护进程模式配置 ★★★
 # ============================================================================
-DEV_MODE = False                    # 开发模式: True=24小时运行, False=仅在工作时间运行
+DEV_MODE = True                     # 开发模式: True=24小时运行, False=仅在工作时间运行
 WORK_START_HOUR = 8                 # 工作开始时间 (仅DEV_MODE=False时生效)
-WORK_END_HOUR = 13                  # 工作结束时间 (仅DEV_MODE=False时生效)
-                                    # 采集任务实际 8-12 点结束，给 1 小时缓冲到 13:00
-NO_TASK_WAIT_SECONDS = 60           # 无任务时单个 worker 等待秒数
-
-# 采集配置（注意: Playwright 不支持多线程，采集必须在主线程串行执行）
-COLLECTOR_IDLE_EXIT_ROUNDS = 10     # 连续 N 轮拉不到任务即退出守护循环
-                                    # 10 * NO_TASK_WAIT_SECONDS = 10 分钟无任务即认为采集结束
+WORK_END_HOUR = 23                  # 工作结束时间 (仅DEV_MODE=False时生效)
+NO_TASK_WAIT_SECONDS = 300          # 无任务时等待秒数 (5分钟)
 
 # ============================================================================
 # ★★★ 浏览器池模式配置 ★★★
@@ -5812,10 +5805,11 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
         log_failure(account_name, 0, table_name, start_date, end_date, error_msg)
         return result
 
-    # 计算目标日期（使用传入的 end_date 参数，避免读模块全局变量）
-    # 注：原先从全局 TARGET_DATE / END_DATE 读取，但在实际运行中 TARGET_DATE 始终为空，
-    # 现已改为使用函数参数 end_date，使 run_store_stats 无副作用，可在并发场景下安全调用
-    target_date = end_date
+    # 计算目标日期（优先使用TARGET_DATE，否则使用END_DATE）
+    if TARGET_DATE:
+        target_date = TARGET_DATE
+    else:
+        target_date = END_DATE
 
     print(f"   目标日期: {target_date}")
     if external_page:
@@ -7113,24 +7107,37 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
     Returns:
         bool: 任务是否执行成功
     """
-    # 使用纯局部变量，execute_single_task 不再写入模块级全局，保证并发安全
+    global ACCOUNT_NAME, START_DATE, END_DATE, TASK, TARGET_DATE
+
     task_id = task_info.get("id")
-    account_name = task_info.get("account_id", "")
-    start_date = task_info.get("data_start_date", "")
-    end_date = task_info.get("data_end_date", "")
-    task = task_info.get("task_type", "all")
+
+    # 填充配置变量
+    ACCOUNT_NAME = task_info.get("account_id", "")
+    START_DATE = task_info.get("data_start_date", "")
+    END_DATE = task_info.get("data_end_date", "")
+    TASK = task_info.get("task_type", "all")
+    TARGET_DATE = ""
+
+    account_name = ACCOUNT_NAME
+    start_date = START_DATE
+    end_date = END_DATE
+    task = TASK
 
     # 评价详细任务使用近7天日期（昨天往前推6天）
     if task in ['review_detail_dianping', 'review_detail_meituan']:
         today = datetime.now()
         end_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")  # 昨天
         start_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")  # 昨天往前6天
+        START_DATE = start_date
+        END_DATE = end_date
 
     # 报表任务使用近30天日期（昨天往前推29天，共30天）
     if task in ['kewen_daily_report', 'promotion_daily_report']:
         today = datetime.now()
         end_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")  # 昨天
         start_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")  # 昨天往前29天
+        START_DATE = start_date
+        END_DATE = end_date
 
     log_collect(account_name, f"开始执行任务 task_id={task_id} task_type={task} 日期范围={start_date}~{end_date}")
 
@@ -7340,21 +7347,26 @@ def main():
     """
     global _daemon_running
 
-    # ========== 单例检查: 防止多进程同时运行 ==========
-    PID_FILE = "/home/meituan/data/meituan_collector.pid"
+    # ========== 解析 worker-id 参数（支持多进程并发） ==========
+    import argparse
+    _parser = argparse.ArgumentParser(add_help=False)
+    _parser.add_argument('--worker-id', type=int, default=1)
+    _args, _ = _parser.parse_known_args()
+    WORKER_ID = _args.worker_id
+
+    # ========== 单例检查: 同 worker-id 不允许重复运行 ==========
+    PID_FILE = f"/home/meituan/data/meituan_collector_{WORKER_ID}.pid"
     os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
 
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, "r") as _f:
                 _old_pid = int(_f.read().strip())
-            # 检查旧进程是否仍在运行
             os.kill(_old_pid, 0)
-            print(f"❌ 已有实例正在运行 (PID={_old_pid})，本次启动退出。")
+            print(f"❌ Worker-{WORKER_ID} 已有实例正在运行 (PID={_old_pid})，本次启动退出。")
             print(f"   若旧进程已卡死，请先执行: kill {_old_pid} && rm {PID_FILE}")
             sys.exit(1)
         except (ProcessLookupError, ValueError):
-            # 旧进程已不存在，清理残留 PID 文件
             os.remove(PID_FILE)
 
     # 写入当前 PID
@@ -7376,8 +7388,9 @@ def main():
 
     # ========== 初始化 ==========
     print("\n" + "=" * 80)
-    print("美团点评数据采集系统 (守护进程模式)")
+    print(f"美团点评数据采集系统 (守护进程模式) [Worker-{WORKER_ID}]")
     print("=" * 80)
+    print(f"   Worker ID: {WORKER_ID}")
     print(f"   运行模式: {'开发模式 (24小时运行)' if DEV_MODE else f'生产模式 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)'}")
     print(f"   浏览器池: {'启用' if USE_BROWSER_POOL and BROWSER_POOL_AVAILABLE else '禁用'}")
     print(f"   无任务等待: {NO_TASK_WAIT_SECONDS // 60} 分钟")
@@ -7409,13 +7422,13 @@ def main():
             else:
                 print(f"   服务器IP: {server_ip}")
 
-                # 初始化浏览器池（仅提供 Browser + Context 容器，不再定时保活）
+                # 初始化浏览器池
                 browser_pool_instance = initialize_browser_pool(headless=HEADLESS)
 
-                # 不再启动保活服务：采集改为任务驱动懒加载，评价回复拆分为独立脚本
-                keepalive_service = None
+                # 启动保活服务（传入server_ip用于定期同步账号）
+                keepalive_service = start_keepalive_service(browser_pool_instance, server_ip=server_ip)
 
-                print("✅ 浏览器池模式初始化完成（保活已禁用，任务驱动懒加载）")
+                print("✅ 浏览器池模式初始化完成")
 
         except Exception as e:
             print(f"❌ 浏览器池初始化失败: {e}")
@@ -7423,208 +7436,191 @@ def main():
             browser_pool_instance = None
             keepalive_service = None
 
-    # ========== 统计信息（线程安全） ==========
-    stats = {"total": 0, "success": 0, "failed": 0}
-    stats_lock = threading.Lock()
+    # 统计信息
+    total_tasks = 0
+    success_tasks = 0
+    failed_tasks = 0
 
-    # 本地重试队列（线程安全，用 queue.Queue）
-    import queue as _queue_mod
-    local_retry_queue = _queue_mod.Queue()
-    MAX_LOCAL_RETRIES = 3
+    _consecutive_no_task_count = 0            # 连续无任务计数
+    _local_retry_queue = []                   # 本地重试队列（资源紧张时暂存任务）
+    MAX_LOCAL_RETRIES = 3                     # 单个任务最大本地重试次数
 
-    # 全局"连续无任务轮次"计数，worker 无任务时 +1，有任务时清零
-    no_task_state = {"rounds": 0}
-    no_task_lock = threading.Lock()
+    print("\n🚀 开始守护进程循环...")
+    print("   按 Ctrl+C 可优雅退出\n")
 
-    def _collector_worker(worker_id: int):
-        """单个采集 worker 的执行循环
-
-        - 每个 worker 独立从服务器拉任务并执行
-        - 账号锁（account_lock_manager）保证同账号任务不会并发
-        - 资源紧张时通过本地重试队列缓冲
-        - 任务驱动懒加载 Context，无保活
-        """
-        worker_name = f"CollectorWorker-{worker_id}"
-        print(f"🧵 {worker_name} 启动")
-
-        # 周期性重新调度失败任务的计时器
-        last_reschedule_time = time.time()
-
+    # ========== 主循环 ==========
+    try:
         while _daemon_running:
             try:
-                # ===== 工作时间检查 =====
+                # ========== Step 1: 时间窗口检查 ==========
                 if not is_in_work_window():
-                    print(f"\n⏰ 已过工作时间 {WORK_END_HOUR}:00，退出采集循环")
-                    break
+                    wait_seconds = seconds_until_work_start()
+                    hours = wait_seconds // 3600
+                    minutes = (wait_seconds % 3600) // 60
+                    print(f"\n{'=' * 60}")
+                    print(f"💤 当前非工作时间 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)")
+                    print(f"   将在 {hours}小时{minutes}分钟 后开始工作...")
+                    print(f"{'=' * 60}")
 
-                # ===== 获取任务 =====
-                task_info = None
-                from_retry_queue = False
-                try:
-                    task_info = local_retry_queue.get_nowait()
-                    from_retry_queue = True
-                    _retry_count = task_info.get('_local_retry_count', 0)
-                    print(f"\n🔄 [{worker_name}] 从本地重试队列取任务（本地第{_retry_count}次重试） "
-                          f"task_id={task_info.get('id')} account={task_info.get('account_id')}")
-                except _queue_mod.Empty:
-                    if browser_pool_instance and server_ip:
-                        task_info = fetch_task(server_ip=server_ip)
-                    else:
-                        task_info = fetch_task()
-
-                if not task_info:
-                    # 无任务：累加全局连续无任务计数
-                    with no_task_lock:
-                        no_task_state["rounds"] += 1
-                        current_rounds = no_task_state["rounds"]
-                    # 连续无任务轮次达到阈值时退出
-                    if current_rounds >= COLLECTOR_IDLE_EXIT_ROUNDS:
-                        print(f"\n✅ 连续 {current_rounds} 轮无任务，今日采集已完成")
-                        break
-                    print(f"\n⏳ [{worker_name}] 暂无任务（连续第{current_rounds}轮），"
-                          f"{NO_TASK_WAIT_SECONDS}秒后重试")
-                    if not interruptible_sleep(NO_TASK_WAIT_SECONDS):
-                        break
+                    if not interruptible_sleep(wait_seconds):
+                        break  # 收到退出信号
                     continue
 
-                # 有任务：重置全局无任务计数
-                if not from_retry_queue:
-                    with no_task_lock:
-                        no_task_state["rounds"] = 0
+                # ========== Step 2: 生成任务调度 ==========
+                create_task_schedule()
+                time.sleep(5)
 
-                # ===== 资源检查（任务执行前） =====
+                # ========== Step 3: 获取任务 ==========
+                # 优先从本地重试队列获取任务（资源紧张时暂存的任务）
+                if _local_retry_queue:
+                    task_info = _local_retry_queue.pop(0)
+                    _retry_count = task_info.get('_local_retry_count', 0)
+                    print(f"\n🔄 从本地重试队列取出任务（本地第{_retry_count}次重试）")
+                    print(f"   任务ID: {task_info.get('id')}, 账户: {task_info.get('account_id')}")
+                # 队列为空时从服务器获取
+                elif browser_pool_instance and server_ip:
+                    task_info = fetch_task(server_ip=server_ip)
+                else:
+                    task_info = fetch_task()
+
+                if not task_info:
+                    _consecutive_no_task_count += 1
+                    print(f"\n⏳ 暂无待执行任务（连续第{_consecutive_no_task_count}次），{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
+                    reschedule_failed_tasks()
+
+                    # 在等待期间执行保活（同步模式 + 资源保护）
+                    if keepalive_service and browser_pool_instance:
+                        # 分段等待，每60秒检查一次
+                        remaining_wait = NO_TASK_WAIT_SECONDS
+                        keepalive_check_interval = 60  # 每60秒检查一次
+
+                        while remaining_wait > 0 and _daemon_running:
+                            # 等待一小段时间
+                            sleep_chunk = min(keepalive_check_interval, remaining_wait)
+                            if not interruptible_sleep(sleep_chunk):
+                                break  # 收到退出信号
+                            remaining_wait -= sleep_chunk
+
+                            if not _daemon_running or remaining_wait <= 0:
+                                break
+
+                            # ===== 资源检查与自动调节 =====
+                            try:
+                                status = resource_monitor.check_status(force=True)
+
+                                if status == resource_monitor.STATUS_CRITICAL:
+                                    # 危险：紧急释放资源
+                                    print("\n🚨 资源危险！执行紧急释放...")
+                                    resource_monitor.print_status()
+                                    browser_pool_instance.emergency_release()
+                                    # 跳过保活
+                                    continue
+
+                                elif status == resource_monitor.STATUS_WARNING:
+                                    # 警告：释放空闲Context，跳过保活
+                                    resource_monitor.print_status()
+                                    browser_pool_instance.release_idle_contexts()
+                                    # 跳过保活
+                                    continue
+
+                                # 正常：执行保活
+                                # 连续无任务>=3次才允许同步补全Context，避免任务执行期间创建大量Context
+                                _allow_sync = _consecutive_no_task_count >= 3
+                                keepalive_service.perform_keepalive_batch(allow_sync=_allow_sync)
+
+                                # 执行Context数量限制
+                                browser_pool_instance.enforce_context_limit()
+
+                            except Exception as e:
+                                print(f"   ⚠️ 空闲处理异常: {e}")
+
+                        if not _daemon_running:
+                            break  # 收到退出信号
+                    else:
+                        # 非浏览器池模式，直接等待
+                        if not interruptible_sleep(NO_TASK_WAIT_SECONDS):
+                            break  # 收到退出信号
+
+                    continue
+
+                # ========== Step 4: 执行任务 ==========
+                # 有任务时重置连续无任务计数
+                _consecutive_no_task_count = 0
+
+                # 资源检查（任务执行前）
                 if browser_pool_instance and BROWSER_POOL_AVAILABLE:
-                    status = resource_monitor.check_status(force=False)
+                    status = resource_monitor.check_status(force=True)
                     if status == resource_monitor.STATUS_CRITICAL:
-                        print(f"\n🚨 [{worker_name}] 资源危险！暂停任务执行...")
+                        print("\n🚨 资源危险！暂停任务执行，等待资源恢复...")
+                        resource_monitor.print_status()
+
+                        # 本地重试：将任务存入本地队列，而不是还给服务器
                         _retry_count = task_info.get('_local_retry_count', 0) + 1
                         task_info['_local_retry_count'] = _retry_count
 
                         if _retry_count >= MAX_LOCAL_RETRIES:
+                            # 本地重试次数已达上限，还给服务器重新排队
                             print(f"   ⚠️ 任务 {task_info.get('id')} 本地重试已达 {MAX_LOCAL_RETRIES} 次，还给服务器")
-                            task_id_for_reset = task_info.get('id')
-                            if task_id_for_reset:
-                                reset_task_schedule(task_id_for_reset)
+                            task_id = task_info.get('id')
+                            if task_id:
+                                reset_task_schedule(task_id)
                         else:
-                            local_retry_queue.put(task_info)
-                            print(f"   📥 任务 {task_info.get('id')} 存入本地重试队列（第{_retry_count}次）")
+                            # 存入本地重试队列，下一轮优先执行
+                            _local_retry_queue.append(task_info)
+                            print(f"   📥 任务 {task_info.get('id')} 存入本地重试队列（第{_retry_count}次，上限{MAX_LOCAL_RETRIES}次）")
 
-                        try:
-                            browser_pool_instance.emergency_release()
-                        except Exception as e:
-                            print(f"   ⚠️ 紧急释放异常: {e}")
+                        browser_pool_instance.emergency_release()
+                        # 等待30秒后重试
                         if not interruptible_sleep(30):
                             break
                         continue
 
-                # ===== 执行任务（账号锁保证同账号互斥） =====
-                with stats_lock:
-                    stats["total"] += 1
-                    current_total = stats["total"]
+                total_tasks += 1
 
-                success = False
+                # 浏览器池模式下使用账号锁
                 if browser_pool_instance:
                     account_id = task_info.get('account_id')
+                    # 获取账号锁（阻塞等待，最多等60秒）
                     if account_lock_manager.acquire(account_id, blocking=True, timeout=60):
                         try:
                             success = execute_single_task(task_info, browser_pool=browser_pool_instance)
                         finally:
                             account_lock_manager.release(account_id)
                     else:
-                        print(f"⚠️ [{worker_name}] 账号 {account_id} 锁获取超时，跳过此任务")
+                        print(f"⚠️ 账号 {account_id} 锁获取超时，跳过此任务")
                         success = False
                 else:
                     success = execute_single_task(task_info)
 
-                with stats_lock:
-                    if success:
-                        stats["success"] += 1
-                    else:
-                        stats["failed"] += 1
-                    print(f"\n📊 [{worker_name}] 累计统计: 总任务={stats['total']} "
-                          f"成功={stats['success']} 失败={stats['failed']}")
+                if success:
+                    success_tasks += 1
+                else:
+                    failed_tasks += 1
 
-                # 周期性重新调度失败任务（每 2 分钟）
-                if time.time() - last_reschedule_time >= 120:
-                    try:
-                        reschedule_failed_tasks()
-                    except Exception as e:
-                        print(f"⚠️ reschedule_failed_tasks 异常: {e}")
-                    last_reschedule_time = time.time()
+                # ========== Step 5: 重新调度失败任务 ==========
+                reschedule_failed_tasks()
 
+                # 打印当前统计
+                print(f"\n📊 累计统计: 总任务={total_tasks}, 成功={success_tasks}, 失败={failed_tasks}")
+
+                # 短暂等待后继续下一轮
+                time.sleep(2)
+
+            except KeyboardInterrupt:
+                # 二次 Ctrl+C 强制退出
+                print("\n⚠️ 再次收到中断信号，强制退出...")
+                break
             except Exception as e:
-                print(f"\n❌ [{worker_name}] 异常: {e}")
+                print(f"\n❌ 主循环发生异常: {e}")
                 import traceback
                 traceback.print_exc()
-                if not interruptible_sleep(30):
+                # 等待一段时间后继续
+                print(f"   将在60秒后继续运行...")
+                if not interruptible_sleep(60):
                     break
-
-        print(f"🧵 {worker_name} 退出")
-
-    print("\n🚀 开始守护进程循环...")
-    print(f"   采集模式: 串行（Playwright 不支持多线程）")
-    print(f"   连续无任务 {COLLECTOR_IDLE_EXIT_ROUNDS} 轮即退出（约 "
-          f"{COLLECTOR_IDLE_EXIT_ROUNDS * NO_TASK_WAIT_SECONDS // 60} 分钟）")
-    print("   按 Ctrl+C 可优雅退出\n")
-
-    # ========== 外层循环：按天运行 ==========
-    try:
-        while _daemon_running:
-            # ===== 等待工作时间窗口 =====
-            if not is_in_work_window():
-                wait_seconds = seconds_until_work_start()
-                hours = wait_seconds // 3600
-                minutes = (wait_seconds % 3600) // 60
-                print(f"\n{'=' * 60}")
-                print(f"💤 当前非工作时间 ({WORK_START_HOUR}:00-{WORK_END_HOUR}:00)")
-                print(f"   将在 {hours}小时{minutes}分钟 后开始工作...")
-                print(f"{'=' * 60}")
-
-                if not interruptible_sleep(wait_seconds):
-                    break
-                continue
-
-            # ===== 生成当日任务调度 =====
-            try:
-                create_task_schedule()
-                time.sleep(5)
-            except Exception as e:
-                print(f"⚠️ create_task_schedule 异常: {e}")
-
-            # ===== 重置本轮全局计数 =====
-            with no_task_lock:
-                no_task_state["rounds"] = 0
-
-            # ===== 在主线程串行执行采集（Playwright 不支持多线程） =====
-            print(f"\n🚀 启动采集循环...")
-            _collector_worker(1)
-
-            # ===== 当日采集结束后的清理 =====
-            print("\n📋 当日采集循环结束")
-            print(f"📊 累计统计: 总任务={stats['total']} 成功={stats['success']} 失败={stats['failed']}")
-
-            # 退出条件判断：是否继续到次日
-            if not _daemon_running:
-                break
-
-            # 等待至次日工作时间
-            if not is_in_work_window():
-                wait_seconds = seconds_until_work_start()
-                print(f"\n💤 今日采集完成，等待 {wait_seconds // 3600} 小时 "
-                      f"{(wait_seconds % 3600) // 60} 分钟至次日 {WORK_START_HOUR}:00")
-                if not interruptible_sleep(wait_seconds):
-                    break
-
-    except KeyboardInterrupt:
-        print("\n⚠️ 再次收到中断信号，强制退出...")
-    except Exception as e:
-        print(f"\n❌ 主循环发生异常: {e}")
-        import traceback
-        traceback.print_exc()
 
     finally:
         # ========== 清理浏览器池 ==========
-        _daemon_running = False
         if browser_pool_instance:
             print("\n🛑 正在关闭浏览器池...")
             try:
@@ -7638,7 +7634,7 @@ def main():
     # ========== 退出 ==========
     print("\n" + "=" * 80)
     print("✅ 守护进程正常退出")
-    print(f"   总任务: {stats['total']}, 成功: {stats['success']}, 失败: {stats['failed']}")
+    print(f"   总任务: {total_tasks}, 成功: {success_tasks}, 失败: {failed_tasks}")
     print("=" * 80)
 
 

@@ -62,8 +62,8 @@ from logger import log_review, log_system, setup_stdout_redirect
 # 配置参数
 # ============================================================================
 
-# 轮询间隔（秒）：30 分钟跑一次，满足 2 小时 SLA 四倍余量
-REPLY_POLL_INTERVAL = 30 * 60
+# 轮询间隔（秒）：10 分钟跑一次
+REPLY_POLL_INTERVAL = 10 * 60
 
 # 账号级并发数：纯 HTTP 任务，10 并发对风控压力很小
 REPLY_CONCURRENCY = 10
