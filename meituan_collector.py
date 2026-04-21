@@ -7302,6 +7302,7 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
     task_errors = []
     has_no_access = False
     has_real_error = False
+    kewen_no_retry_error = None  # kewen_daily_report 不可重试的失败原因
     for result in results:
         if not result.get('success'):
             task_name = result.get('task_name', '未知任务')
@@ -7311,6 +7312,11 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
                 has_no_access = True
             else:
                 has_real_error = True
+            if task_name == 'kewen_daily_report' and kewen_no_retry_error is None:
+                if '报表模板ID' in error_msg or '报表模版ID' in error_msg:
+                    kewen_no_retry_error = '未获取到报表模版ID'
+                elif '部分上传失败' in error_msg:
+                    kewen_no_retry_error = '模版无效'
 
     if len(task_errors) == 0:
         log_collect(account_name, f"任务成功 task_id={task_id} task_type={task}")
@@ -7321,6 +7327,11 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
         all_errors = "\n".join(task_errors)
         log_collect(account_name, f"任务无权限 task_id={task_id}: {all_errors}", "WARN")
         report_task_callback(task_id, status=4, error_message=all_errors, retry_add=0)
+        return False
+    elif kewen_no_retry_error:
+        # kewen_daily_report 模版相关失败，不重试（模版无效重试无意义）
+        log_collect(account_name, f"任务失败 task_id={task_id}: {kewen_no_retry_error}", "ERROR")
+        report_task_callback(task_id, status=3, error_message=kewen_no_retry_error, retry_add=0)
         return False
     else:
         all_errors = "\n".join(task_errors)
