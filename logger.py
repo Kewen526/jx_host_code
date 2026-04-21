@@ -20,6 +20,7 @@ import sys
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
+from contextvars import ContextVar
 
 # ============================================================================
 # 配置
@@ -37,6 +38,21 @@ MODULE_SYSTEM = "系统"
 
 # 无账号时的占位符
 NO_ACCOUNT = "-"
+
+# 当前账号上下文（用于自动给 print() 输出打上账号标签）
+_current_account: ContextVar[str] = ContextVar('current_account', default="")
+
+
+def set_current_account(account: str):
+    _current_account.set(account or "")
+
+
+def clear_current_account():
+    _current_account.set("")
+
+
+def get_current_account() -> str:
+    return _current_account.get()
 
 # ============================================================================
 # 初始化日志系统
@@ -205,7 +221,8 @@ class _StdoutRedirector:
             else:
                 # 未格式化的 print 输出，包装为系统日志格式写入文件
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                formatted = f"[{timestamp}] [{self._level}] [{MODULE_SYSTEM}] [{NO_ACCOUNT}] {stripped}"
+                account = get_current_account() or NO_ACCOUNT
+                formatted = f"[{timestamp}] [{self._level}] [{MODULE_SYSTEM}] [{account}] {stripped}"
                 try:
                     _file_logger.info(formatted)
                 except Exception:

@@ -26,7 +26,16 @@ from io import BytesIO
 from contextlib import contextmanager
 
 # 统一日志模块导入
-from logger import log_collect, log_system, setup_stdout_redirect
+from logger import log_collect, log_system, setup_stdout_redirect, set_current_account, clear_current_account
+
+# MySQL 连接（用于失败任务重试）
+try:
+    import pymysql
+    PYMYSQL_AVAILABLE = True
+except ImportError:
+    PYMYSQL_AVAILABLE = False
+    print("⚠️ 未安装pymysql，失败任务自动重试功能将不可用")
+    print("   安装方法: pip install pymysql")
 
 # Playwright导入 (用于store_stats任务)
 try:
@@ -137,6 +146,19 @@ TEMPLATES_ID_UPDATE_API_URL = "https://kewenai.asia/api/up/templates_id"
 
 # 报表中心页面URL（用于获取/创建模板时跳转）
 REPORT_CENTER_URL = "https://e.dianping.com/app/merchant-platform/0fb1bec0bade47d?iUrl=Ly9oNS5kaWFucGluZy5jb20vdmctcGMtYWR2aWNlL3JlcG9ydC1jZW50ZXIvaW5kZXguaHRtbA"
+
+# ============================================================================
+# MySQL 配置（失败任务重试）
+# ============================================================================
+MYSQL_CONFIG = {
+    "host": "8.146.210.145",
+    "port": 3306,
+    "user": "root",
+    "password": "Kewen888@",
+    "database": "jx_data_info",
+    "charset": "utf8mb4",
+}
+RETRY_CHECK_INTERVAL = 1800  # 失败任务重试检查间隔（秒）= 30 分钟
 
 # 创建报表模板时使用的固定指标列表
 TEMPLATE_METRIC_LIST = ",".join([
@@ -7097,6 +7119,119 @@ def print_summary(results: List[Dict[str, Any]]):
     print("=" * 80)
 
 
+def _get_mysql_connection():
+    return pymysql.connect(**MYSQL_CONFIG, cursorclass=pymysql.cursors.DictCursor)
+
+
+def retry_failed_tasks_from_db(server_ip: str, browser_pool: 'BrowserPoolManager' = None) -> int:
+    """从数据库捞取因Cookie失效而失败、但Cookie已恢复的任务，重新执行
+
+    Returns:
+        int: 成功重试的任务数量
+    """
+    if not PYMYSQL_AVAILABLE:
+        log_system("pymysql 未安装，跳过失败任务重试", "WARN")
+        return 0
+
+    if not server_ip:
+        log_system("无服务器IP，跳过失败任务重试", "WARN")
+        return 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_system(f"🔍 开始检查失败任务（server={server_ip}, date={today}）")
+
+    conn = None
+    retry_count = 0
+    try:
+        conn = _get_mysql_connection()
+
+        # 步骤1: 查询今天本服务器上status=3且因登录/Cookie失效的任务
+        with conn.cursor() as cursor:
+            sql = """
+                SELECT id, account_id, task_type, data_start_date, data_end_date
+                FROM task_schedule
+                WHERE task_date = %s
+                  AND server = %s
+                  AND status = 3
+                  AND (error_message LIKE %s OR error_message LIKE %s)
+            """
+            cursor.execute(sql, (today, server_ip, '%登录失效%', '%Cookie失效%'))
+            failed_tasks = cursor.fetchall()
+
+        if not failed_tasks:
+            log_system("未发现可重试的失败任务")
+            return 0
+
+        log_system(f"发现 {len(failed_tasks)} 个因登录/Cookie失效的任务，开始检查账号状态")
+
+        # 步骤2: 收集所有account_id，批量查询auth_status
+        account_ids = list(set(t['account_id'] for t in failed_tasks))
+
+        with conn.cursor() as cursor:
+            placeholders = ','.join(['%s'] * len(account_ids))
+            sql = f"""
+                SELECT account, auth_status
+                FROM platform_accounts
+                WHERE account IN ({placeholders})
+            """
+            cursor.execute(sql, account_ids)
+            account_status = {row['account']: row['auth_status'] for row in cursor.fetchall()}
+
+        # 步骤3: 过滤出auth_status=valid的账号
+        valid_accounts = set(acc for acc, status in account_status.items() if status == 'valid')
+
+        if not valid_accounts:
+            log_system("所有失败任务的账号仍为invalid状态，无需重试")
+            return 0
+
+        tasks_to_retry = [t for t in failed_tasks if t['account_id'] in valid_accounts]
+        log_system(f"有 {len(tasks_to_retry)} 个任务的Cookie已恢复，开始重试")
+
+        # 步骤4: 逐个执行
+        for task_row in tasks_to_retry:
+            task_info = {
+                "id": task_row["id"],
+                "account_id": task_row["account_id"],
+                "task_type": task_row["task_type"],
+                "data_start_date": str(task_row["data_start_date"]) if task_row["data_start_date"] else "",
+                "data_end_date": str(task_row["data_end_date"]) if task_row["data_end_date"] else "",
+            }
+
+            log_system(f"🔄 重试任务 id={task_row['id']} account={task_row['account_id']} type={task_row['task_type']}")
+
+            success = execute_single_task(task_info, browser_pool=browser_pool)
+
+            if success:
+                # 步骤5: 成功后更新 status=2
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            "UPDATE task_schedule SET status = 2 WHERE id = %s",
+                            (task_row["id"],)
+                        )
+                    conn.commit()
+                    log_system(f"✅ 任务 id={task_row['id']} 重试成功，status 已更新为 2")
+                    retry_count += 1
+                except Exception as e:
+                    log_system(f"更新任务状态失败 id={task_row['id']}: {e}", "ERROR")
+            else:
+                log_system(f"❌ 任务 id={task_row['id']} 重试失败", "WARN")
+
+    except Exception as e:
+        log_system(f"失败任务重试异常: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    log_system(f"失败任务重试完成，成功 {retry_count} 个")
+    return retry_count
+
+
 def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolManager' = None) -> bool:
     """执行单个任务
 
@@ -7107,6 +7242,20 @@ def execute_single_task(task_info: Dict[str, Any], browser_pool: 'BrowserPoolMan
     Returns:
         bool: 任务是否执行成功
     """
+    global ACCOUNT_NAME, START_DATE, END_DATE, TASK, TARGET_DATE
+
+    task_id = task_info.get("id")
+
+    # 设置当前账号上下文（让所有 print 输出自动带上账号标签）
+    set_current_account(task_info.get("account_id", ""))
+
+    try:
+        return _execute_single_task_inner(task_info, browser_pool)
+    finally:
+        clear_current_account()
+
+
+def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'BrowserPoolManager' = None) -> bool:
     global ACCOUNT_NAME, START_DATE, END_DATE, TASK, TARGET_DATE
 
     task_id = task_info.get("id")
@@ -7449,6 +7598,7 @@ def main():
     _consecutive_no_task_count = 0            # 连续无任务计数
     _local_retry_queue = []                   # 本地重试队列（资源紧张时暂存任务）
     MAX_LOCAL_RETRIES = 3                     # 单个任务最大本地重试次数
+    _last_db_retry_time = 0                   # 上次数据库失败任务重试检查时间
 
     print("\n🚀 开始守护进程循环...")
     print("   按 Ctrl+C 可优雅退出\n")
@@ -7492,6 +7642,16 @@ def main():
                     _consecutive_no_task_count += 1
                     print(f"\n⏳ 暂无待执行任务（连续第{_consecutive_no_task_count}次），{NO_TASK_WAIT_SECONDS // 60}分钟后重试...")
                     reschedule_failed_tasks()
+
+                    # 每30分钟检查一次数据库中因Cookie失效而失败、但Cookie已恢复的任务
+                    now_ts = time.time()
+                    if now_ts - _last_db_retry_time >= RETRY_CHECK_INTERVAL:
+                        _last_db_retry_time = now_ts
+                        _retry_ip = server_ip
+                        if not _retry_ip and BROWSER_POOL_AVAILABLE:
+                            _retry_ip = get_cached_ip() or get_public_ip()
+                        if _retry_ip:
+                            retry_failed_tasks_from_db(_retry_ip, browser_pool=browser_pool_instance)
 
                     # 在等待期间执行保活（同步模式 + 资源保护）
                     if keepalive_service and browser_pool_instance:
