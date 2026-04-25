@@ -49,6 +49,10 @@ VALID_TYPES = ["采集", "保活", "评价回复", "系统"]
 def get_log_files(date_str: str = None) -> list:
     """获取日志文件列表
 
+    由于 TimedRotatingFileHandler 的轮转发生在午夜后的第一次写入，
+    某天的日志可能分布在前一天的轮转文件和当天文件中。
+    因此查询时会包含前一天的轮转文件，通过时间戳过滤确保准确性。
+
     Args:
         date_str: 日期字符串，格式 "YYYY-MM-DD" 或 "YYYY-MM-DD:YYYY-MM-DD"（日期范围）
                   None 表示今天
@@ -61,11 +65,7 @@ def get_log_files(date_str: str = None) -> list:
         return []
 
     if date_str is None:
-        # 默认查询今天 → 当前活跃日志文件
-        active_log = os.path.join(LOG_DIR, LOG_BASE)
-        if os.path.exists(active_log):
-            return [active_log]
-        return []
+        date_str = datetime.now().strftime("%Y-%m-%d")
 
     # 解析日期范围
     if ":" in date_str:
@@ -87,32 +87,38 @@ def get_log_files(date_str: str = None) -> list:
             print(f"错误: 日期格式无效，应为 YYYY-MM-DD", file=sys.stderr)
             return []
 
+    # 扩展范围：包含前一天的轮转文件（应对轮转边界问题）
+    search_start = start_date - timedelta(days=1)
+
     # 收集匹配的文件
     files = []
     today = datetime.now().strftime("%Y-%m-%d")
+    active_log = os.path.join(LOG_DIR, LOG_BASE)
 
-    current = start_date
+    current = search_start
     while current <= end_date:
         date_suffix = current.strftime("%Y-%m-%d")
 
         if date_suffix == today:
-            # 今天的日志在活跃文件中
-            active_log = os.path.join(LOG_DIR, LOG_BASE)
             if os.path.exists(active_log) and active_log not in files:
                 files.append(active_log)
         else:
-            # 历史日志在滚动文件中
             rotated_log = os.path.join(LOG_DIR, f"{LOG_BASE}.{date_suffix}")
-            if os.path.exists(rotated_log):
+            if os.path.exists(rotated_log) and rotated_log not in files:
                 files.append(rotated_log)
 
         current += timedelta(days=1)
+
+    # 今天的活跃日志总是包含在内（可能包含尚未轮转的条目）
+    if os.path.exists(active_log) and active_log not in files:
+        files.append(active_log)
 
     return sorted(files)
 
 
 def query_logs(files: list, account: str = None, log_type: str = None,
-               level: str = None, tail: int = None) -> list:
+               level: str = None, tail: int = None,
+               date_filter: str = None) -> list:
     """查询日志内容
 
     Args:
@@ -121,11 +127,25 @@ def query_logs(files: list, account: str = None, log_type: str = None,
         log_type: 模块类型过滤（采集/保活/评价回复/系统）
         level: 日志级别过滤（INFO/WARN/ERROR）
         tail: 限制输出的最后N行
+        date_filter: 日期过滤，格式 "YYYY-MM-DD" 或 "YYYY-MM-DD:YYYY-MM-DD"
+                     只返回时间戳在此范围内的日志行
 
     Returns:
         匹配的日志行列表
     """
     results = []
+
+    # 解析日期过滤范围
+    filter_start = None
+    filter_end = None
+    if date_filter:
+        if ":" in date_filter:
+            parts = date_filter.split(":")
+            filter_start = parts[0].strip()
+            filter_end = parts[1].strip()
+        else:
+            filter_start = date_filter.strip()
+            filter_end = filter_start
 
     for filepath in files:
         try:
@@ -135,7 +155,13 @@ def query_logs(files: list, account: str = None, log_type: str = None,
                     if not line:
                         continue
 
-                    # 过滤条件
+                    # 时间戳日期过滤：日志格式 [YYYY-MM-DD HH:MM:SS.mmm] ...
+                    if filter_start and line.startswith("["):
+                        line_date = line[1:11]  # 提取 YYYY-MM-DD
+                        if len(line_date) == 10 and line_date[4] == '-':
+                            if line_date < filter_start or line_date > filter_end:
+                                continue
+
                     if account and f"[{account}]" not in line:
                         continue
 
@@ -239,13 +265,14 @@ def main():
         print(f"日志目录: {LOG_DIR}")
         return
 
-    # 查询
+    # 查询（传入日期过滤，确保跨文件搜索时只返回匹配日期的行）
     results = query_logs(
         files=files,
         account=args.account,
         log_type=args.type,
         level=args.level,
-        tail=args.tail
+        tail=args.tail,
+        date_filter=args.date or datetime.now().strftime("%Y-%m-%d"),
     )
 
     # 输出
