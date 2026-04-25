@@ -3086,6 +3086,15 @@ def run_kewen_daily_report(account_name: str, start_date: str, end_date: str, te
                 if not kewen_is_valid_coupon_type(data):
                     coupon_type_skip_count += 1
                     continue
+            # Excel 中无 coupon 列时补充必填字段默认值，避免服务器 API 400 校验失败
+            if coupon_type_col is None:
+                data.setdefault('coupon_code_type', '')
+                data.setdefault('coupon_pay_order_count', 0)
+                data.setdefault('coupon_pay_amount', 0)
+                data.setdefault('coupon_verify_amount', 0)
+                data.setdefault('coupon_scan_users', 0)
+                data.setdefault('coupon_scan_collect_count', 0)
+                data.setdefault('coupon_scan_review_count', 0)
             data_list.append(data)
         print(f"✅ 解析完成:")
         print(f"   有效数据: {len(data_list)} 条 (全部码)")
