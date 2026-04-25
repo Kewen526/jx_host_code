@@ -7009,6 +7009,7 @@ def report_task_callback(task_id: int, status: int, error_message: str, retry_ad
 
         if response.status_code == 200:
             print("   ✅ 任务状态上报成功")
+            _verify_task_callback_db(task_id, status, error_message)
             return True
         else:
             print(f"   ❌ 任务状态上报失败: HTTP {response.status_code}")
@@ -7016,6 +7017,49 @@ def report_task_callback(task_id: int, status: int, error_message: str, retry_ad
     except Exception as e:
         print(f"   ❌ 任务状态上报异常: {e}")
         return False
+
+
+def _verify_task_callback_db(task_id: int, status: int, error_message: str):
+    """callback 后校验数据库是否正确写入，若未写入则直接 SQL 更新"""
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=MYSQL_CONFIG["host"],
+            port=MYSQL_CONFIG["port"],
+            user=MYSQL_CONFIG["user"],
+            password=MYSQL_CONFIG["password"],
+            database=MYSQL_CONFIG["database"],
+            charset=MYSQL_CONFIG["charset"],
+            connect_timeout=10
+        )
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT status, error_message FROM task_schedule WHERE id = %s",
+                    (task_id,)
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    print(f"   ⚠️ [DB校验] task_id={task_id} 记录不存在")
+                    return
+
+                db_status, db_error_msg = row
+                needs_update = (db_status != status) or (db_error_msg != error_message)
+
+                if needs_update:
+                    print(f"   ⚠️ [DB校验] 数据库未更新: status={db_status}, error_message={db_error_msg}")
+                    cursor.execute(
+                        "UPDATE task_schedule SET status = %s, error_message = %s WHERE id = %s",
+                        (status, error_message, task_id)
+                    )
+                    conn.commit()
+                    print(f"   ✅ [DB校验] 已直接更新 task_id={task_id}: status={status}, error_message={error_message}")
+                else:
+                    print(f"   ✅ [DB校验] task_id={task_id} 数据库已正确写入")
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   ⚠️ [DB校验] 数据库校验异常: {e}")
 
 
 def reset_task_schedule(task_id: int) -> bool:
@@ -7465,7 +7509,7 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
                 if '报表模板ID' in error_msg or '报表模版ID' in error_msg:
                     kewen_no_retry_error = '未获取到报表模版ID'
                 elif '部分上传失败' in error_msg:
-                    kewen_no_retry_error = '模版无效'
+                    kewen_no_retry_error = error_msg
 
     if len(task_errors) == 0:
         log_collect(account_name, f"任务成功 task_id={task_id} task_type={task}")
