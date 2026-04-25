@@ -5789,6 +5789,359 @@ class DianpingStoreStats:
         print(f"\n📊 上传完成: 成功 {success_count}, 失败 {fail_count}")
         return fail_count == 0
 
+    # -----------------------------------------------------------------------
+    # 历史数据补全
+    # -----------------------------------------------------------------------
+
+    def _get_flow_data_all_dates(self) -> Dict[str, Dict[str, int]]:
+        """下载近30天客流数据，返回 {shop_id: {date_str: checkin_count}}"""
+        print("\n📥 下载近30天客流Excel数据...")
+        now = datetime.now()
+        end_date = now - timedelta(days=1) if now.hour >= 7 else now - timedelta(days=2)
+        start_date = end_date - timedelta(days=29)
+        date_range = f"{start_date.strftime('%Y-%m-%d')},{end_date.strftime('%Y-%m-%d')}"
+        print(f"   日期范围: {date_range}")
+
+        url = "https://e.dianping.com/gateway/adviser/data"
+        params = {
+            'componentId': 'flowDataSummaryDownloadPCAsync', 'pageType': 'flowAnalysis',
+            'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.1.1',
+            'mtgsig': self._get_mtgsig()
+        }
+        post_data = {
+            'source': '1', 'device': 'pc', 'pageType': 'flowAnalysis',
+            'shopIds': '0', 'platform': '0', 'date': date_range
+        }
+        result: Dict[str, Dict[str, int]] = {}
+        try:
+            session = self._get_session()
+            response = session.post(url, params=params, data=post_data,
+                                    headers=self._get_headers(), cookies=self.cookies, timeout=60)
+            response.raise_for_status()
+            resp_json = response.json()
+            if resp_json.get('code') != 200:
+                print(f"   ❌ API返回错误: {resp_json.get('msg')}")
+                return result
+
+            file_url = None
+            for item in resp_json.get('data', []):
+                if item.get('body', {}).get('fileUrl'):
+                    file_url = item['body']['fileUrl']
+                    break
+            if not file_url:
+                print("   ❌ 未获取到文件URL")
+                return result
+
+            file_response = session.get(file_url, timeout=60)
+            df = pd.read_excel(BytesIO(file_response.content))
+            print(f"   📊 读取到 {len(df)} 行数据")
+
+            date_col = df.columns[0]
+            shop_id_col = df.columns[3]
+            checkin_col = df.columns[36]
+            df[date_col] = pd.to_datetime(df[date_col])
+
+            for _, row in df.iterrows():
+                if not pd.notna(row[shop_id_col]) or not pd.notna(row[date_col]):
+                    continue
+                shop_id = str(int(row[shop_id_col]))
+                date_str = row[date_col].strftime('%Y-%m-%d')
+                checkin = int(row[checkin_col]) if pd.notna(row[checkin_col]) else 0
+                result.setdefault(shop_id, {})[date_str] = checkin
+
+            print(f"   ✅ 解析完成: {len(result)} 个门店, "
+                  f"共 {sum(len(v) for v in result.values())} 条记录")
+        except Exception as e:
+            print(f"   ❌ 下载30天客流数据失败: {e}")
+        return result
+
+    def _get_force_offline_history(self) -> Dict[str, Dict[str, int]]:
+        """分页获取近30天强制下线消息，返回 {date_str: {shop_id: count}}"""
+        print("\n📥 获取近30天强制下线消息...")
+        cutoff = (datetime.now() - timedelta(days=30)).date()
+        api_url = "https://e.dianping.com/gateway/msg/MessageDzService/queryPcMessageList"
+        headers = {
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json',
+            'Referer': 'https://e.dianping.com/app/vg-pc-platform-merchant-selfhelp/newNoticeCenter.html',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        }
+        result: Dict[str, Dict[str, int]] = {}
+        page_no = 1
+        page_size = 100
+        session = self._get_session()
+
+        while True:
+            try:
+                response = session.post(
+                    api_url,
+                    params={'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.1.1'},
+                    headers=headers,
+                    cookies=self.cookies,
+                    json={"messageCategoryCode": 0, "status": None, "subCategoryIdList": None,
+                          "important": 1, "pageNo": page_no, "pageSize": page_size},
+                    timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
+                if data.get('status') != 0:
+                    print(f"   ⚠️ 消息API返回错误: status={data.get('status')}")
+                    break
+
+                message_list = data.get('messageList', [])
+                if not message_list:
+                    break
+
+                oldest_date = None
+                for msg in message_list:
+                    if '强制下线' not in msg.get('title', ''):
+                        continue
+                    create_time = msg.get('createTime', 0)
+                    if not create_time:
+                        continue
+                    msg_date = datetime.fromtimestamp(create_time / 1000).date()
+                    if oldest_date is None or msg_date < oldest_date:
+                        oldest_date = msg_date
+                    if msg_date < cutoff:
+                        continue
+                    date_str = msg_date.strftime('%Y-%m-%d')
+                    shop_id = str(msg.get('mtShopId') or self.shop_id or '')
+                    if shop_id:
+                        result.setdefault(date_str, {})[shop_id] = \
+                            result.get(date_str, {}).get(shop_id, 0) + 1
+
+                print(f"   第{page_no}页: {len(message_list)} 条消息")
+
+                if len(message_list) < page_size:
+                    break
+                if oldest_date and oldest_date < cutoff:
+                    break
+                page_no += 1
+                random_delay(0.5, 1)
+            except Exception as e:
+                print(f"   ⚠️ 获取消息第{page_no}页失败: {e}")
+                break
+
+        total = sum(sum(v.values()) for v in result.values())
+        print(f"   ✅ 共获取 {total} 条强制下线记录")
+        return result
+
+    def _get_rival_rank_for_date(self, shop_id: str, region_id: int,
+                                  date_str: str) -> Dict[str, int]:
+        """获取指定门店指定日期的同行排名"""
+        url = "https://e.dianping.com/gateway/adviser/data"
+        params = {
+            'device': 'pc', 'source': '1', 'pageType': 'rivalAnalysisV2', 'sign': '',
+            'dateType': '1', 'platform': '0', 'shopIds': shop_id,
+            'regionId': str(region_id), 'regionType': '商圈',
+            'componentId': 'shopRankListDownload',
+            'date': f"{date_str},{date_str}",
+            'yodaReady': 'h5', 'csecplatform': '4', 'csecversion': '4.1.1',
+            'mtgsig': self._get_mtgsig()
+        }
+        headers = {
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': 'https://e.dianping.com/codejoy/2703/home/index.html',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        default_result = {'order_user_rank': 0, 'verify_amount_rank': 0}
+        try:
+            session = self._get_session()
+            response = session.get(url, params=params, headers=headers,
+                                   cookies=self.cookies, timeout=60)
+            response.raise_for_status()
+            resp_json = response.json()
+            if resp_json.get('code') != 200:
+                return default_result
+
+            file_url = None
+            for item in resp_json.get('data', []):
+                if item.get('body', {}).get('fileUrl'):
+                    file_url = item['body']['fileUrl']
+                    break
+            if not file_url:
+                return default_result
+
+            file_response = session.get(file_url, timeout=60)
+            df = pd.read_excel(BytesIO(file_response.content))
+            if len(df) == 0:
+                return default_result
+
+            shop_id_col = df.columns[4]
+            order_rank_col = df.columns[10]
+            verify_rank_col = df.columns[14]
+
+            for _, row in df.iterrows():
+                if not pd.notna(row[shop_id_col]):
+                    continue
+                if str(int(row[shop_id_col])) == shop_id:
+                    return {
+                        'order_user_rank': self._parse_rank_value(row[order_rank_col]),
+                        'verify_amount_rank': self._parse_rank_value(row[verify_rank_col])
+                    }
+        except Exception as e:
+            print(f"      ❌ 获取{date_str}排名失败: {e}")
+        return default_result
+
+    def _query_missing_dates(self) -> Dict[str, List[str]]:
+        """查询近30天每个门店缺失的日期，返回 {shop_id: [date_str, ...]}"""
+        if not self.shop_list:
+            return {}
+        now = datetime.now()
+        end_date = (now - timedelta(days=1)).date()
+        start_date = end_date - timedelta(days=29)
+
+        all_dates: set = set()
+        d = start_date
+        while d <= end_date:
+            all_dates.add(d.strftime('%Y-%m-%d'))
+            d += timedelta(days=1)
+
+        int_shop_ids = [int(s['shop_id']) for s in self.shop_list]
+        str_shop_ids = [str(s['shop_id']) for s in self.shop_list]
+
+        try:
+            import pymysql
+            conn = pymysql.connect(**MYSQL_CONFIG, connect_timeout=10)
+            try:
+                with conn.cursor() as cursor:
+                    placeholders = ','.join(['%s'] * len(int_shop_ids))
+                    cursor.execute(
+                        f"SELECT store_id, date FROM store_stats "
+                        f"WHERE store_id IN ({placeholders}) "
+                        f"AND date >= %s AND date <= %s",
+                        int_shop_ids + [start_date.strftime('%Y-%m-%d'),
+                                        end_date.strftime('%Y-%m-%d')]
+                    )
+                    rows = cursor.fetchall()
+            finally:
+                conn.close()
+
+            existing: Dict[str, set] = {sid: set() for sid in str_shop_ids}
+            for store_id, date_val in rows:
+                sid = str(store_id)
+                date_str = (date_val.strftime('%Y-%m-%d')
+                            if hasattr(date_val, 'strftime') else str(date_val)[:10])
+                if sid in existing:
+                    existing[sid].add(date_str)
+
+            missing = {}
+            for sid in str_shop_ids:
+                gap = sorted(all_dates - existing[sid])
+                if gap:
+                    missing[sid] = gap
+
+            total = sum(len(v) for v in missing.values())
+            print(f"   发现缺失: {total} 条 (涉及 {len(missing)} 个门店)")
+            return missing
+        except Exception as e:
+            print(f"   ⚠️ 查询缺失日期失败: {e}")
+            return {}
+
+    def _query_ad_balances(self, shop_ids: List[str]) -> Dict[str, float]:
+        """批量获取每个门店最新的广告余额（单次DB连接）"""
+        if not shop_ids:
+            return {}
+        try:
+            import pymysql
+            conn = pymysql.connect(**MYSQL_CONFIG, connect_timeout=10)
+            try:
+                with conn.cursor() as cursor:
+                    placeholders = ','.join(['%s'] * len(shop_ids))
+                    cursor.execute(
+                        f"SELECT store_id, ad_balance FROM store_stats "
+                        f"WHERE store_id IN ({placeholders}) ORDER BY date DESC",
+                        [int(sid) for sid in shop_ids]
+                    )
+                    rows = cursor.fetchall()
+            finally:
+                conn.close()
+            result: Dict[str, float] = {}
+            for store_id, balance in rows:
+                sid = str(store_id)
+                if sid not in result:
+                    result[sid] = float(balance) if balance is not None else 0.0
+            return result
+        except Exception as e:
+            print(f"   ⚠️ 批量查询余额失败: {e}")
+            return {}
+
+    def backfill_store_stats(self) -> None:
+        """补全近30天缺失的store_stats数据"""
+        print(f"\n{'=' * 60}")
+        print("🔄 开始补全历史store_stats数据（近30天）")
+        print(f"{'=' * 60}")
+
+        print("\n📋 查询缺失日期...")
+        missing = self._query_missing_dates()
+        if not missing:
+            print("✅ 近30天数据完整，无需补全")
+            return
+
+        flow_data = self._get_flow_data_all_dates()
+        force_msgs = self._get_force_offline_history()
+        ad_balances = self._query_ad_balances(list(missing.keys()))
+
+        shop_name_map = {str(s['shop_id']): s['shop_name'] for s in self.shop_list}
+
+        def get_region_id(shop_id: str):
+            info = self.shop_region_info.get(shop_id, {})
+            return info.get('regions', {}).get('business', {}).get('regionId')
+
+        upload_api = UPLOAD_APIS["store_stats"]
+        session = self._get_session()
+        success_count = 0
+        fail_count = 0
+
+        for shop_id, missing_dates in missing.items():
+            shop_name = shop_name_map.get(shop_id, shop_id)
+            region_id = get_region_id(shop_id)
+
+            for date_str in missing_dates:
+                print(f"\n   📌 补全 {shop_name}({shop_id}) {date_str}")
+
+                checkin = flow_data.get(shop_id, {}).get(date_str, 0)
+                is_force_offline = 1 if force_msgs.get(date_str, {}).get(shop_id, 0) > 0 else 0
+                ad_balance = ad_balances.get(shop_id, 0.0)
+
+                if region_id:
+                    rank = self._get_rival_rank_for_date(shop_id, region_id, date_str)
+                    random_delay(1, 2)
+                else:
+                    rank = {'order_user_rank': 0, 'verify_amount_rank': 0}
+
+                data = {
+                    "store_name": shop_name,
+                    "store_id": int(shop_id),
+                    "checkin_count": checkin,
+                    "order_user_rank": rank['order_user_rank'],
+                    "verify_amount_rank": rank['verify_amount_rank'],
+                    "ad_order_count": 0,
+                    "ad_balance": ad_balance,
+                    "is_force_offline": is_force_offline,
+                    "date": date_str
+                }
+
+                try:
+                    resp = session.post(
+                        upload_api, json=data,
+                        headers={'Content-Type': 'application/json'}, timeout=30
+                    )
+                    if resp.status_code in [200, 201]:
+                        success_count += 1
+                        print(f"      ✅ checkin={checkin} rank={rank['order_user_rank']}/"
+                              f"{rank['verify_amount_rank']} force={is_force_offline}")
+                    else:
+                        fail_count += 1
+                        print(f"      ❌ HTTP {resp.status_code}: {resp.text[:100]}")
+                except Exception as e:
+                    fail_count += 1
+                    print(f"      ❌ 上传异常: {e}")
+
+        print(f"\n{'=' * 60}")
+        print(f"📊 补全完成: 成功 {success_count} 条, 失败 {fail_count} 条")
+        print(f"{'=' * 60}")
+
 
 # ============================================================================
 # run_store_stats 任务函数
@@ -5870,6 +6223,12 @@ def run_store_stats(account_name: str, start_date: str, end_date: str, external_
         else:
             result["error_message"] = "部分数据上传失败"
             log_failure(account_name, 0, table_name, target_date, target_date, result["error_message"])
+
+        # 正常采集完成后补全近30天缺失数据
+        try:
+            collector.backfill_store_stats()
+        except Exception as e:
+            print(f"⚠️ 补全历史数据失败: {e}")
 
     except AuthInvalidError as e:
         # 登录失效异常 - 调用三个接口上报
