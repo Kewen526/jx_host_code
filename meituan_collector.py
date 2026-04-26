@@ -2312,6 +2312,66 @@ def create_report_template(cookies: dict, mtgsig: str, template_name: str = "Kew
         session.close()
 
 
+def _resave_report_template(cookies: dict, mtgsig: str, template_id: int, template_name: str) -> bool:
+    """刷新已有报表模版（保存接口传入已有ID，不创建新模版）"""
+    print(f"\n📤 刷新报表模版: id={template_id}, name={template_name}")
+    print(f"   API地址: {TEMPLATE_SAVE_API}")
+
+    session = get_session()
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://h5.dianping.com',
+        'Referer': 'https://h5.dianping.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+    }
+    params = {
+        'yodaReady': 'h5',
+        'csecplatform': '4',
+        'csecversion': '4.1.1',
+        'mtgsig': generate_mtgsig(cookies, mtgsig)
+    }
+    post_data = {
+        'source': '1',
+        'device': 'pc',
+        'id': str(template_id),
+        'name': template_name,
+        'platform': '0',
+        'relationObjectIds': '0',
+        'compareTypes': '',
+        'metricList': TEMPLATE_METRIC_LIST,
+        'dateType': 'day',
+        'dateSubType': '',
+        'statsType': 'shop',
+        'summaryType': 'shop'
+    }
+    try:
+        response = session.post(
+            TEMPLATE_SAVE_API,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            data=post_data,
+            timeout=API_TIMEOUT,
+            proxies={'http': None, 'https': None}
+        )
+        print(f"   HTTP状态码: {response.status_code}")
+        resp_json = response.json()
+        print(f"   响应内容: {json.dumps(resp_json, ensure_ascii=False)}")
+        if resp_json.get('code') == 200:
+            print(f"   ✅ 模版刷新成功")
+            return True
+        else:
+            print(f"   ❌ 模版刷新失败: {resp_json.get('msg', '未知错误')}")
+            return False
+    except Exception as e:
+        print(f"   ❌ 模版刷新请求异常: {e}")
+        return False
+    finally:
+        session.close()
+
+
 def update_template_id_to_backend(account_name: str, templates_id: int) -> bool:
     """将templates_id回写到后端数据库
 
@@ -7924,10 +7984,85 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
         report_task_callback(task_id, status=4, error_message=all_errors, retry_add=0)
         return False
     elif kewen_no_retry_error:
-        # kewen_daily_report 模版相关失败，不重试（模版无效重试无意义）
-        log_collect(account_name, f"任务失败 task_id={task_id}: {kewen_no_retry_error}", "ERROR")
-        _update_task_schedule_direct(task_id, status=3, error_message=kewen_no_retry_error, retry_add=0)
-        return False
+        if '部分上传失败' in kewen_no_retry_error:
+            # 尝试刷新模版后重试 kewen_daily_report（仅一次）
+            print(f"\n{'=' * 80}")
+            print("🔄 检测到部分上传失败，尝试刷新模版后重试 kewen_daily_report")
+            print(f"{'=' * 80}")
+
+            _cookies = platform_account.get('cookie', {})
+            _mtgsig = platform_account.get('mtgsig')
+            refresh_ok = False
+
+            try:
+                list_result = get_template_list(_cookies, _mtgsig)
+                if list_result.get('code') == 200:
+                    tpl_list = list_result.get('data', {}).get('list', [])
+                    matched = next((t for t in tpl_list if t.get('id') == templates_id), None)
+                    if matched:
+                        tpl_name = matched.get('name', '')
+                        print(f"   找到模版: id={templates_id}, name={tpl_name}")
+                        refresh_ok = _resave_report_template(_cookies, _mtgsig, templates_id, tpl_name)
+                    else:
+                        print(f"   ⚠️ 模版列表中未找到 id={templates_id}，跳过刷新")
+                else:
+                    print(f"   ⚠️ 获取模版列表失败 code={list_result.get('code')}，跳过刷新")
+            except Exception as e:
+                print(f"   ⚠️ 刷新模版过程异常: {e}，跳过刷新")
+
+            if not refresh_ok:
+                # 刷新失败，直接上报原始错误
+                log_collect(account_name, f"任务失败 task_id={task_id}: {kewen_no_retry_error}", "ERROR")
+                _update_task_schedule_direct(task_id, status=3, error_message=kewen_no_retry_error, retry_add=0)
+                return False
+
+            # 刷新成功，重试 kewen_daily_report
+            print(f"\n🔄 重试 kewen_daily_report...")
+            retry_result = run_kewen_daily_report(
+                account_name, start_date, end_date,
+                templates_id=templates_id,
+                cookies=_cookies,
+                mtgsig=_mtgsig
+            )
+            # 上报重试结果到 data_upload_log
+            upload_task_status_single(account_name, start_date, end_date, retry_result)
+
+            # 用重试结果替换原始 kewen 结果，重新评估整体状态
+            new_results = [r for r in results if r.get('task_name') != 'kewen_daily_report']
+            new_results.append(retry_result)
+
+            new_task_errors = []
+            new_has_no_access = False
+            new_has_real_error = False
+            for r in new_results:
+                if not r.get('success'):
+                    tn = r.get('task_name', '未知任务')
+                    em = r.get('error_message', '未知错误')
+                    new_task_errors.append(f"[{tn}] {em}")
+                    if r.get('no_access') or is_no_access_error(em):
+                        new_has_no_access = True
+                    else:
+                        new_has_real_error = True
+
+            if len(new_task_errors) == 0:
+                log_collect(account_name, f"任务成功（kewen重试后）task_id={task_id} task_type={task}")
+                report_task_callback(task_id, status=2, error_message="", retry_add=0)
+                return True
+            elif new_has_no_access and not new_has_real_error:
+                all_errors = "\n".join(new_task_errors)
+                log_collect(account_name, f"任务无权限（kewen重试后）task_id={task_id}: {all_errors}", "WARN")
+                report_task_callback(task_id, status=4, error_message=all_errors, retry_add=0)
+                return False
+            else:
+                all_errors = "\n".join(new_task_errors)
+                log_collect(account_name, f"任务失败（kewen重试后）task_id={task_id}: {all_errors}", "ERROR")
+                _update_task_schedule_direct(task_id, status=3, error_message=all_errors, retry_add=0)
+                return False
+        else:
+            # 模版ID问题，不重试
+            log_collect(account_name, f"任务失败 task_id={task_id}: {kewen_no_retry_error}", "ERROR")
+            _update_task_schedule_direct(task_id, status=3, error_message=kewen_no_retry_error, retry_add=0)
+            return False
     else:
         all_errors = "\n".join(task_errors)
         log_collect(account_name, f"任务失败 task_id={task_id}: {all_errors}", "ERROR")
