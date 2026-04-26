@@ -7421,6 +7421,49 @@ def _verify_task_callback_db(task_id: int, status: int, error_message: str):
         print(f"   ⚠️ [DB校验] 数据库校验异常: {e}")
 
 
+def _update_task_schedule_direct(task_id: int, status: int, error_message: str, retry_add: int) -> bool:
+    """直接通过 SQL 更新 task_schedule 状态，用于 status=3 失败场景，不依赖 HTTP 回调接口"""
+    print(f"\n{'=' * 80}")
+    print("📝 直接写入任务失败状态到数据库")
+    print(f"{'=' * 80}")
+    print(f"   任务ID: {task_id}")
+    print(f"   状态: {status}")
+    if error_message:
+        print(f"   错误信息: {error_message[:200]}")
+    print(f"   retry_add: {retry_add}")
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=MYSQL_CONFIG["host"],
+            port=MYSQL_CONFIG["port"],
+            user=MYSQL_CONFIG["user"],
+            password=MYSQL_CONFIG["password"],
+            database=MYSQL_CONFIG["database"],
+            charset=MYSQL_CONFIG["charset"],
+            connect_timeout=10
+        )
+        try:
+            with conn.cursor() as cursor:
+                if retry_add:
+                    cursor.execute(
+                        "UPDATE task_schedule SET status=%s, error_message=%s, retry_count=retry_count+1 WHERE id=%s",
+                        (status, error_message, task_id)
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE task_schedule SET status=%s, error_message=%s WHERE id=%s",
+                        (status, error_message, task_id)
+                    )
+                conn.commit()
+                print(f"   ✅ task_id={task_id} 已写入数据库: status={status}")
+                return True
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"   ❌ 直接写入数据库失败: {e}")
+        return False
+
+
 def reset_task_schedule(task_id: int) -> bool:
     """重置任务状态（资源不足时归还任务）
 
@@ -7705,13 +7748,13 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
     if not account_name:
         error_msg = "账户名称为空"
         log_collect(account_name, f"任务失败: {error_msg}", "ERROR")
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        _update_task_schedule_direct(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     if not validate_date(start_date) or not validate_date(end_date):
         error_msg = "日期格式错误，应为 YYYY-MM-DD"
         print(f"❌ {error_msg}")
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        _update_task_schedule_direct(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     start = datetime.strptime(start_date, '%Y-%m-%d')
@@ -7719,14 +7762,14 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
     if start > end:
         error_msg = "开始日期不能大于结束日期"
         print(f"❌ {error_msg}")
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        _update_task_schedule_direct(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     valid_tasks = ['all'] + list(TASK_MAP.keys())
     if task not in valid_tasks:
         error_msg = f"无效的任务名称: {task}，可选值: {', '.join(valid_tasks)}"
         print(f"❌ {error_msg}")
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        _update_task_schedule_direct(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     # ========== 获取平台账户信息并检查 templates_id ==========
@@ -7747,7 +7790,7 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
             'record_count': 0,
             'error_message': error_msg
         }])
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        _update_task_schedule_direct(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     # 检查 auth_status 是否为无效状态
@@ -7764,7 +7807,7 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
             'error_message': error_msg
         }])
         # retry_add=0 避免无效重试（Cookie未更新时重试没有意义）
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=0)
+        _update_task_schedule_direct(task_id, status=3, error_message=error_msg, retry_add=0)
         return False
 
     templates_id = platform_account.get('templates_id')
@@ -7828,7 +7871,7 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
             error_str = str(e)
             if "登录失败" in error_str or "Cookie登录失败" in error_str or "登录失效" in error_str:
                 report_auth_invalid(account_name)
-            report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+            _update_task_schedule_direct(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     # 检查结果是否为空（所有任务未执行，可能是登录失效或启动失败）
@@ -7838,7 +7881,7 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
         # 上报cookie失效状态到platform_accounts
         report_auth_invalid(account_name)
         log_failure(account_name, 0, "all_tasks_not_executed", start_date, end_date, error_msg)
-        report_task_callback(task_id, status=3, error_message=error_msg, retry_add=1)
+        _update_task_schedule_direct(task_id, status=3, error_message=error_msg, retry_add=1)
         return False
 
     print_summary(results)
@@ -7883,12 +7926,12 @@ def _execute_single_task_inner(task_info: Dict[str, Any], browser_pool: 'Browser
     elif kewen_no_retry_error:
         # kewen_daily_report 模版相关失败，不重试（模版无效重试无意义）
         log_collect(account_name, f"任务失败 task_id={task_id}: {kewen_no_retry_error}", "ERROR")
-        report_task_callback(task_id, status=3, error_message=kewen_no_retry_error, retry_add=0)
+        _update_task_schedule_direct(task_id, status=3, error_message=kewen_no_retry_error, retry_add=0)
         return False
     else:
         all_errors = "\n".join(task_errors)
         log_collect(account_name, f"任务失败 task_id={task_id}: {all_errors}", "ERROR")
-        report_task_callback(task_id, status=3, error_message=all_errors, retry_add=1)
+        _update_task_schedule_direct(task_id, status=3, error_message=all_errors, retry_add=1)
         return False
 
 
