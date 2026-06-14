@@ -5563,7 +5563,7 @@ class DianpingStoreStats:
 
             shop_id_col = df.columns[4]
             order_rank_col = df.columns[10]
-            verify_rank_col = df.columns[14]
+            verify_rank_col = df.columns[12]
 
             for _, row in df.iterrows():
                 row_shop_id = str(int(row[shop_id_col])) if pd.notna(row[shop_id_col]) else None
@@ -6029,7 +6029,7 @@ class DianpingStoreStats:
 
             shop_id_col = df.columns[4]
             order_rank_col = df.columns[10]
-            verify_rank_col = df.columns[14]
+            verify_rank_col = df.columns[12]
 
             for _, row in df.iterrows():
                 if not pd.notna(row[shop_id_col]):
